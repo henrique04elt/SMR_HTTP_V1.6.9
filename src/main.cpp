@@ -1,14 +1,13 @@
 /***********************************************Smart Ruler Firmware (ARP-first + Device ID)*****************************************
- * Autor: Henrique Rosa 
+ * Autor: Henrique Rosa
  * Projeto: Smart Ruler (SMR)
- * Versão: 1.6.7 - Descoberta de PC robusta (ARP) + Busca ID dispositivo
+ * Versão: 1.9.2 - Descoberta de PC com exclusão de switch
  * Data: [Dez/2024]
- * Atualizado : 10/09/2025
  * Foco desta versão:
  *   - Descoberta do PC por ARP (rápida e confiável)
- *   - Busca do ID do dispositivo via HTTP GET em /elemidia_v4/util/iot_hub/scripts/dispositivo.json
+ *   - EXCLUSÃO DO SWITCH 192.168.1.229
+ *   - Busca do ID do dispositivo via HTTP GET
  *   - Persistência de IP/MAC/ID em NVS
- *   - Inclusão do device_id no payload de status
  ***********************************************************************************************************************/
 
 // -------------------------------------------------------------------------------------------
@@ -21,9 +20,8 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
-#include <ArduinoJson.h>  // Para parsing do JSON
+#include <ArduinoJson.h>
 
-// lwIP (ARP / netif)
 extern "C" {
   #include "lwip/err.h"
   #include "lwip/ip4_addr.h"
@@ -45,10 +43,10 @@ extern "C" {
 // -------------------------------------------------------------------------------------------
 //                               Definições de pinos
 // -------------------------------------------------------------------------------------------
-#define RELAY_MODEM_PIN     14    // RL1
-#define RELAY_PC_PIN        32    // RL2
-#define RELAY_K3            12    // RL3
-#define RELAY_K4            33    // RL4
+#define RELAY_MODEM_PIN     14
+#define RELAY_PC_PIN        32
+#define RELAY_K3            12
+#define RELAY_K4            33
 
 // -------------------------------------------------------------------------------------------
 //                              Definições de ENDPOINT
@@ -56,17 +54,17 @@ extern "C" {
 #define STATUS_ENDPOINT        "https://iothub-v2-homolog.eletromidia.com.br/api/v1/reguas/pub"
 #define COMMAND_SUB_ENDPOINT   "https://iothub-v2-homolog.eletromidia.com.br/api/v1/reguas/sub"
 #define COMMAND_SUB_CONFIR     "https://iothub-v2-homolog.eletromidia.com.br/api/v1/reguas/subACK"
-
-// Endpoint do dispositivo.json no NUC
 #define DEVICE_INFO_PATH       "/elemidia_v4/util/iot_hub/scripts/dispositivo.json"
+
+// IP DO SWITCH QUE DEVE SER IGNORADO
+#define SWITCH_IP_TO_IGNORE    "192.168.1.229"
 
 // -------------------------------------------------------------------------------------------
 //                          Configurações e Timeouts
 // -------------------------------------------------------------------------------------------
-#define STATUS_INTERVAL_MS          120000  // 2 min
-#define COMMAND_INTERVAL_MS         3000    // 3 s
-#define CONNECTIVITY_INTERVAL_MS    80000   // 80 s
-
+#define STATUS_INTERVAL_MS          120000
+#define COMMAND_INTERVAL_MS         3000
+#define CONNECTIVITY_INTERVAL_MS    80000
 #define RESET_DURATION_MS           5000
 #define MODEM_RESET_MIN_INTERVAL_MS 180000
 #define PC_RESET_MIN_INTERVAL_MS    60000
@@ -76,16 +74,11 @@ extern "C" {
 #define MAX_CONSECUTIVE_FAILURES    7
 #define EVENT_TYPE                  "keep_alive"
 #define DETAIL                      "regua-boe"
-
 #define HTTP_TIMEOUT_SHORT          2000
 #define HTTP_TIMEOUT_MEDIUM         4000
-
-// Descoberta de PC (teto total)
-#define PC_DISCOVERY_TIMEOUT_MS     25000   // ~25s
-#define PC_DISCOVERY_STEP_DELAY     8       // 8 ms entre probes ARP
-#define ARP_REPLY_WAIT_MS           28      // espera curta por resposta ARP
-
-// Watchdog
+#define PC_DISCOVERY_TIMEOUT_MS     25000
+#define PC_DISCOVERY_STEP_DELAY     8
+#define ARP_REPLY_WAIT_MS           28
 #define WDT_TIMEOUT                 45
 
 // -------------------------------------------------------------------------------------------
@@ -105,22 +98,17 @@ String modemIP = "";
 String pcIP    = "";
 String pcMAC   = "";
 String deviceMAC = "";
-String deviceID = "";  // ID do dispositivo (do JSON)
+String deviceID = "";
 Preferences prefs;
 
-// Estados dos relés
 RelayResetState modemRelayState = {0, false, 0, 0};
 RelayResetState pcRelayState    = {0, false, 0, 0};
 
-// Flags de controle
 volatile bool externalModemReset = false;
 volatile bool externalPCReset    = false;
 bool pcResetOccurred    = false;
 bool modemResetOccurred = false;
 
-// -------------------------------------------------------------------------------------------
-//                              Configuração NTP
-// -------------------------------------------------------------------------------------------
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600, 60000);
 
@@ -130,18 +118,17 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600, 60000);
 void   logMessage(const String &level, const String &tag, const String &message);
 bool   checkModemConnectivity();
 bool   checkPCConnectivity();
-String discoverPC();                         // ARP-first
-bool   validatePCIP(const IPAddress &ip);    // ARP validation + (opcional) ICMP
+String discoverPC();
+bool   validatePCIP(const IPAddress &ip);
 bool   arpProbe(const IPAddress &ip, String *macOut);
 bool   isInfrastructureHost(uint8_t last);
 void   savePC(const String &ip, const String &mac, const String &id);
 void   loadPC(String &ip, String &mac, String &id);
-String fetchDeviceID(const String &pcIP);    // Nova função para buscar ID
-
+void   clearSavedPC();
+String fetchDeviceID(const String &pcIP);
 void   activateRelay(int relayPin, RelayResetState* state, const String &relayName);
 void   deactivateRelay(int relayPin, RelayResetState* state, const String &relayName);
 void   resetDeviceNonBlocking(int relayPin, unsigned long delayTime, RelayResetState* state);
-
 void   sendStatusToEndpoint();
 void   handleCommandsFromEndpoint();
 String obterTimestamp();
@@ -164,7 +151,6 @@ String getPCMacAddress() {
   return deviceMAC;
 }
 
-// Converte MAC binário para string "AA:BB:CC:DD:EE:FF"
 static String macToString(const uint8_t *m) {
   char buf[18];
   snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", m[0],m[1],m[2],m[3],m[4],m[5]);
@@ -172,10 +158,9 @@ static String macToString(const uint8_t *m) {
 }
 
 static struct netif* getEthNetif() {
-  return netif_default; // em projetos simples, aponta para a interface ativa (ETH)
+  return netif_default;
 }
 
-// Faz probe ARP no IP, aguardando curta janela por resposta e consulta o cache
 bool arpProbe(const IPAddress &ip, String *macOut) {
   struct netif *nif = getEthNetif();
   if (!nif) return false;
@@ -183,7 +168,6 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
   ip4_addr_t addr;
   IP4_ADDR(&addr, ip[0], ip[1], ip[2], ip[3]);
 
-  // 1) Verifica se já está no cache
   struct eth_addr *eth_ret = nullptr;
   const ip4_addr_t *ip_ret = nullptr;
   s8_t r = etharp_find_addr(nif, &addr, &eth_ret, &ip_ret);
@@ -192,7 +176,6 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
     return true;
   }
 
-  // 2) Envia ARP request e espera retorno curto
   etharp_request(nif, &addr);
   uint32_t t0 = millis();
   while ((millis() - t0) < ARP_REPLY_WAIT_MS) {
@@ -206,16 +189,13 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
   return false;
 }
 
-// Valida um IP candidato por ARP e, opcionalmente, por ICMP (1 tentativa)
 bool validatePCIP(const IPAddress &ip) {
   String mac;
   bool ok = arpProbe(ip, &mac);
   if (!ok) return false;
-
-  // Guarda MAC visto
+  
   pcMAC = mac;
-
-  // ICMP opcional: a lib não tem timeout custom; 1 tentativa é suficiente
+  
   bool icmp = Ping.ping(ip, 1);
   if (!icmp) {
     logMessage("[WARN]", "DISCOVERY", "ARP OK, ICMP falhou (possível filtro). Aceitando por ARP.");
@@ -223,12 +203,12 @@ bool validatePCIP(const IPAddress &ip) {
   return true;
 }
 
-// Evita confundir com gateway/broadcast/infra
+// MODIFICADA: Agora exclui 229 (switch)
 bool isInfrastructureHost(uint8_t last) {
-  return (last == 0) || (last == 1) || (last == 254) || (last == 255) || (last == 201);
+  return (last == 0) || (last == 1) || (last == 254) || (last == 255) || 
+         (last == 201) || (last == 229);  // INCLUÍDO 229
 }
 
-// Nova função para buscar o ID do dispositivo via HTTP
 String fetchDeviceID(const String &pcIP) {
   if (pcIP.isEmpty()) return "";
   
@@ -244,8 +224,6 @@ String fetchDeviceID(const String &pcIP) {
   
   if (httpResponseCode == 200) {
     String response = http.getString();
-    
-    // Parse JSON para extrair o ID
     StaticJsonDocument<512> doc;
     DeserializationError error = deserializeJson(doc, response);
     
@@ -285,10 +263,22 @@ void loadPC(String &ip, String &mac, String &id) {
   prefs.end();
 }
 
+// NOVA FUNÇÃO: Limpar dados salvos
+void clearSavedPC() {
+  prefs.begin("smr", false);
+  prefs.remove("pc_ip");
+  prefs.remove("pc_mac");
+  prefs.remove("pc_id");
+  prefs.end();
+  pcIP = "";
+  pcMAC = "";
+  deviceID = "";
+  logMessage("[INFO]", "SYSTEM", "Dados do PC limpos da memória");
+}
+
 // -------------------------------------------------------------------------------------------
 //                               Tarefas (FreeRTOS)
 // -------------------------------------------------------------------------------------------
-
 void connectivityTask(void *parameter) {
   unsigned long lastCheck = 0;
   esp_task_wdt_add(NULL);
@@ -296,7 +286,6 @@ void connectivityTask(void *parameter) {
   for (;;) {
     esp_task_wdt_reset();
 
-    // Comandos urgentes
     if (externalModemReset || externalPCReset) {
       logMessage("[INFO]", "CONNECTIVITY", "COMANDO URGENTE DETECTADO - PROCESSANDO");
       if (externalModemReset) {
@@ -328,7 +317,6 @@ void connectivityTask(void *parameter) {
       esp_task_wdt_reset();
       bool modemOk = true;
 
-      // Cooldown do modem
       if (modemRelayState.lastResetTime > 0 &&
           (millis() - modemRelayState.lastResetTime) < MODEM_COOLDOWN_AFTER_RESET) {
         unsigned long remainingCooldown = (MODEM_COOLDOWN_AFTER_RESET - (millis() - modemRelayState.lastResetTime)) / 1000;
@@ -347,20 +335,24 @@ void connectivityTask(void *parameter) {
 
       esp_task_wdt_reset();
 
-      // Descoberta do PC (ARP-first) somente se modem OK
+      // MODIFICADO: Verifica se é o switch antes de processar
       if (modemOk && pcIP.isEmpty()) {
         logMessage("[INFO]", "CONNECTIVITY", "Descobrindo IP do PC (ARP-first)");
         pcIP = discoverPC();
         if (!pcIP.isEmpty()) {
-          logMessage("[INFO]", "CONNECTIVITY", "PC encontrado: " + pcIP + (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC));
-          
-          // Buscar ID do dispositivo
-          deviceID = fetchDeviceID(pcIP);
-          if (!deviceID.isEmpty()) {
-            logMessage("[INFO]", "CONNECTIVITY", "Device ID obtido: " + deviceID);
+          // VERIFICA SE É O SWITCH
+          if (pcIP == SWITCH_IP_TO_IGNORE) {
+            logMessage("[ERROR]", "CONNECTIVITY", "Switch detectado como PC - Ignorando e limpando");
+            clearSavedPC();
+            pcIP = "";  // Força nova descoberta
+          } else {
+            logMessage("[INFO]", "CONNECTIVITY", "PC encontrado: " + pcIP + (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC));
+            deviceID = fetchDeviceID(pcIP);
+            if (!deviceID.isEmpty()) {
+              logMessage("[INFO]", "CONNECTIVITY", "Device ID obtido: " + deviceID);
+            }
+            savePC(pcIP, pcMAC, deviceID);
           }
-          
-          savePC(pcIP, pcMAC, deviceID);
         } else {
           logMessage("[WARN]", "CONNECTIVITY", "PC não encontrado após timeout");
         }
@@ -368,7 +360,6 @@ void connectivityTask(void *parameter) {
 
       esp_task_wdt_reset();
 
-      // Verificação do PC com cooldown
       if (modemOk && !pcIP.isEmpty()) {
         if (pcRelayState.lastResetTime > 0 &&
             (millis() - pcRelayState.lastResetTime) < PC_COOLDOWN_AFTER_RESET) {
@@ -383,7 +374,6 @@ void connectivityTask(void *parameter) {
               pcResetOccurred = true;
             }
           } else {
-            // Se PC está OK e não temos ID, tentar buscar novamente
             if (deviceID.isEmpty()) {
               deviceID = fetchDeviceID(pcIP);
               if (!deviceID.isEmpty()) {
@@ -406,7 +396,6 @@ void connectivityTask(void *parameter) {
         pcResetOccurred = false;
       }
       
-      // Log com status completo
       String statusMsg = "Status: Modem=" + String(modemOk ? "OK" : "FAIL");
       statusMsg += " | PC=" + (pcIP.isEmpty() ? "Não encontrado" : pcIP);
       statusMsg += " | ID=" + (deviceID.isEmpty() ? "Não obtido" : deviceID);
@@ -414,7 +403,6 @@ void connectivityTask(void *parameter) {
       logMessage("[INFO]", "CONNECTIVITY", "Verificação concluída");
     }
 
-    // Gestão de relés (sempre)
     resetDeviceNonBlocking(RELAY_MODEM_PIN, RESET_DURATION_MS, &modemRelayState);
     resetDeviceNonBlocking(RELAY_PC_PIN,   RESET_DURATION_MS, &pcRelayState);
 
@@ -456,9 +444,8 @@ void commandsTask(void *parameter) {
 // -------------------------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  logMessage("[INFO]", "SYSTEM", "Inicializando Smart Ruler v1.9.1b (ARP + Device ID)");
+  logMessage("[INFO]", "SYSTEM", "Inicializando Smart Ruler v1.9.2 (Switch Exclusion)");
 
-  // Relés
   pinMode(RELAY_MODEM_PIN, OUTPUT);
   pinMode(RELAY_PC_PIN,   OUTPUT);
   pinMode(RELAY_K3,       OUTPUT);
@@ -468,17 +455,14 @@ void setup() {
   digitalWrite(RELAY_K3,       LOW);
   digitalWrite(RELAY_K4,       LOW);
 
-  // Watchdog
   esp_task_wdt_init(WDT_TIMEOUT, true);
 
-  // Ethernet
   if (!ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER_PIN, ETH_PHY_MDC_PIN, ETH_PHY_MDIO_PIN, ETH_PHY_TYPE, ETH_CLK_MODE)) {
     logMessage("[ERROR]", "NETWORK", "Falha ao inicializar Ethernet");
     ESP.restart();
   }
   logMessage("[INFO]", "NETWORK", "Ethernet inicializado");
 
-  // DHCP com timeout
   const unsigned long DHCP_TIMEOUT = 60000;
   uint32_t t0 = millis();
   while (ETH.localIP() == INADDR_NONE) {
@@ -490,7 +474,6 @@ void setup() {
   }
   logMessage("[INFO]", "NETWORK", "IP obtido: " + ETH.localIP().toString());
 
-  // Gateway
   IPAddress gw = ETH.gatewayIP();
   if (gw == INADDR_NONE) {
     modemIP = "192.168.0.1";
@@ -500,35 +483,34 @@ void setup() {
     logMessage("[INFO]", "NETWORK", "Gateway encontrado: " + modemIP);
   }
 
-  // NTP
   timeClient.begin();
   timeClient.update();
-
-  // Seed rand
   randomSeed(micros());
 
-  // Carrega IP/MAC/ID persistidos do PC (se houver)
+  // CRÍTICO: VERIFICA SE O IP SALVO É O SWITCH
   loadPC(pcIP, pcMAC, deviceID);
   if (!pcIP.isEmpty()) {
-    logMessage("[INFO]", "DISCOVERY", "PC salvo: " + pcIP + 
-               (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC) +
-               (deviceID.isEmpty() ? "" : "  ID=" + deviceID));
-    IPAddress ip; ip.fromString(pcIP);
-    if (!validatePCIP(ip)) {
-      logMessage("[WARN]", "DISCOVERY", "PC salvo inválido. Nova descoberta será necessária.");
-      pcIP  = "";
-      pcMAC = "";
-      deviceID = "";
-    } else if (deviceID.isEmpty()) {
-      // Se PC válido mas sem ID, tentar buscar
-      deviceID = fetchDeviceID(pcIP);
-      if (!deviceID.isEmpty()) {
-        savePC(pcIP, pcMAC, deviceID);
+    // SE FOR O SWITCH, LIMPA TUDO
+    if (pcIP == SWITCH_IP_TO_IGNORE) {
+      logMessage("[WARN]", "DISCOVERY", "IP salvo é o switch conhecido - LIMPANDO DADOS");
+      clearSavedPC();
+    } else {
+      logMessage("[INFO]", "DISCOVERY", "PC salvo: " + pcIP + 
+                 (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC) +
+                 (deviceID.isEmpty() ? "" : "  ID=" + deviceID));
+      IPAddress ip; ip.fromString(pcIP);
+      if (!validatePCIP(ip)) {
+        logMessage("[WARN]", "DISCOVERY", "PC salvo inválido. Nova descoberta será necessária.");
+        clearSavedPC();
+      } else if (deviceID.isEmpty()) {
+        deviceID = fetchDeviceID(pcIP);
+        if (!deviceID.isEmpty()) {
+          savePC(pcIP, pcMAC, deviceID);
+        }
       }
     }
   }
 
-  // Tasks
   xTaskCreatePinnedToCore(connectivityTask, "ConnectivityTask", 8192, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(statusTask,       "StatusTask",       6144, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(commandsTask,     "CommandsTask",     6144, NULL, 3, NULL, 1);
@@ -584,7 +566,6 @@ bool checkPCConnectivity() {
   logMessage("[DEBUG]", "PC", "Verificando conectividade: " + pcIP);
 
   IPAddress ip; ip.fromString(pcIP);
-  // Primeiro tenta ARP (rápido)
   String mac;
   bool arpOk = arpProbe(ip, &mac);
   if (arpOk && !pcMAC.isEmpty() && !mac.isEmpty() && (mac != pcMAC)) {
@@ -601,7 +582,6 @@ bool checkPCConnectivity() {
     return true;
   }
 
-  // Fallback: 1 ping rápido
   bool icmp = Ping.ping(ip, 1);
   if (icmp) return true;
 
@@ -609,7 +589,7 @@ bool checkPCConnectivity() {
   return false;
 }
 
-// Descoberta ARP-first com persistência em NVS
+// MODIFICADA: Ignora o switch durante descoberta
 String discoverPC() {
   const uint32_t TMAX = PC_DISCOVERY_TIMEOUT_MS;
   uint32_t t0 = millis();
@@ -617,21 +597,28 @@ String discoverPC() {
   IPAddress myIP = ETH.localIP();
   IPAddress gwIP = ETH.gatewayIP();
 
-  // Prefixo /24
   IPAddress base(myIP[0], myIP[1], myIP[2], 0);
   uint8_t myLast = myIP[3];
 
   logMessage("[INFO]", "DISCOVERY", "ARP-first na sub-rede: " + String(base[0]) + "." + String(base[1]) + "." + String(base[2]) + ".x");
+  logMessage("[INFO]", "DISCOVERY", "IGNORANDO SWITCH: " + String(SWITCH_IP_TO_IGNORE));
 
-  // 0) IPs comuns (prioridade)
+  // IPs comuns (sem 229!)
   const uint8_t commons[] = {20,21,22,23,24,25, 10,11,12,13, 30,50,
-                             100,101,102,103,104,105, 120,150, 200,201,205,210,220,230,240};
+                             100,101,102,103,104,105, 120,150, 200,205,210,220,230,240};
   for (size_t i=0; i<sizeof(commons); ++i) {
     if ((millis() - t0) > TMAX) { logMessage("[WARN]", "DISCOVERY", "Timeout nos IPs comuns"); return ""; }
     uint8_t h = commons[i];
     if (isInfrastructureHost(h) || h == myLast) continue;
 
     IPAddress ip(base[0], base[1], base[2], h);
+    
+    // VERIFICA SE É O SWITCH
+    if (ip.toString() == SWITCH_IP_TO_IGNORE) {
+      logMessage("[DEBUG]", "DISCOVERY", "Ignorando switch conhecido: " + ip.toString());
+      continue;
+    }
+    
     String mac;
     if (arpProbe(ip, &mac)) {
       if (h == gwIP[3]) { logMessage("[DEBUG]", "DISCOVERY", "Ignorando gateway (" + ip.toString() + ")"); continue; }
@@ -642,7 +629,7 @@ String discoverPC() {
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
   }
 
-  // 1) Janela ao redor do próprio IP (±32)
+  // Janela ao redor do próprio IP
   int start = max(2, (int)myLast - 32);
   int end   = min(253, (int)myLast + 32);
   for (int h = start; h <= end; ++h) {
@@ -650,6 +637,13 @@ String discoverPC() {
     if (h == myLast || isInfrastructureHost(h) || h == gwIP[3]) continue;
 
     IPAddress ip(base[0], base[1], base[2], (uint8_t)h);
+    
+    // VERIFICA SE É O SWITCH
+    if (ip.toString() == SWITCH_IP_TO_IGNORE) {
+      logMessage("[DEBUG]", "DISCOVERY", "Ignorando switch conhecido: " + ip.toString());
+      continue;
+    }
+    
     String mac;
     if (arpProbe(ip, &mac)) {
       pcMAC = mac;
@@ -659,12 +653,19 @@ String discoverPC() {
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
   }
 
-  // 2) Varredura restante do /24 (ARP-only)
+  // Varredura restante
   for (int h = 2; h <= 253; ++h) {
     if ((millis() - t0) > TMAX) { logMessage("[WARN]", "DISCOVERY", "Timeout no /24"); return ""; }
     if (h == myLast || isInfrastructureHost(h) || h == gwIP[3] || (h >= start && h <= end)) continue;
 
     IPAddress ip(base[0], base[1], base[2], (uint8_t)h);
+    
+    // VERIFICA SE É O SWITCH
+    if (ip.toString() == SWITCH_IP_TO_IGNORE) {
+      logMessage("[DEBUG]", "DISCOVERY", "Ignorando switch conhecido: " + ip.toString());
+      continue;
+    }
+    
     String mac;
     if (arpProbe(ip, &mac)) {
       pcMAC = mac;
@@ -672,22 +673,6 @@ String discoverPC() {
       return ip.toString();
     }
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
-  }
-
-  // 3) Último recurso: 3 IPs aleatórios com ICMP
-  for (int k=0; k<3; ++k) {
-    if ((millis() - t0) > TMAX) break;
-    uint8_t h = 2 + (random(2, 253));
-    if (isInfrastructureHost(h) || h == myLast) continue;
-    IPAddress ip(base[0], base[1], base[2], h);
-    if (Ping.ping(ip, 1)) {
-      String mac;
-      if (arpProbe(ip, &mac)) {
-        pcMAC = mac;
-        logMessage("[INFO]", "DISCOVERY", "Encontrado (ICMP+ARP): " + ip.toString() + "  MAC=" + mac);
-        return ip.toString();
-      }
-    }
   }
 
   return "";
@@ -734,7 +719,7 @@ void resetDeviceNonBlocking(int relayPin, unsigned long delayTime, RelayResetSta
 }
 
 // -------------------------------------------------------------------------------------------
-//                          Comunicação (com device_id no payload)
+//                          Comunicação
 // -------------------------------------------------------------------------------------------
 String obterTimestamp() {
   timeClient.update();
@@ -754,7 +739,6 @@ void sendStatusToEndpoint() {
   String k3Status = digitalRead(RELAY_K3) == HIGH ? "on" : "off";
   String k4Status = digitalRead(RELAY_K4) == HIGH ? "on" : "off";
 
-  // Payload com device_id
   String payload = "{";
   payload += "\"csrf\": \"" + String(millis()) + "\",";
   payload += "\"event\": \"" + String(EVENT_TYPE) + "\",";
@@ -762,7 +746,7 @@ void sendStatusToEndpoint() {
   payload += "\"timestamp\": \"" + obterTimestamp() + "\",";
   payload += "\"mac_address\": \"" + getPCMacAddress() + "\",";
   if (!deviceID.isEmpty()) {
-    payload += "\"device_id\": \"" + deviceID + "\",";  // Incluir ID se disponível
+    payload += "\"device_id\": \"" + deviceID + "\",";
   }
   payload += "\"modem_status\": \"" + String(modemResetOccurred ? "reset" : "ok") + "\",";
   payload += "\"pc_status\": \"" + String(pcResetOccurred ? "reset" : "ok") + "\",";
