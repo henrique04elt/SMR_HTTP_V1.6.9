@@ -1,13 +1,15 @@
 /***********************************************Smart Ruler Firmware (ARP-first + Device ID)*****************************************
  * Autor: Henrique Rosa
  * Projeto: Smart Ruler (SMR)
- * Versão: 1.9.2 - Descoberta de PC com exclusão de switch
+ * Versão: 1.9.5 - Exclusão múltipla de IPs + 3 tentativas + Cooldown
  * Data: [Dez/2024]
  * Foco desta versão:
  *   - Descoberta do PC por ARP (rápida e confiável)
- *   - EXCLUSÃO DO SWITCH 192.168.1.229
+ *   - EXCLUSÃO DE MÚLTIPLOS IPs: 192.168.1.229, 192.168.1.237, 192.168.0.237
  *   - Busca do ID do dispositivo via HTTP GET
  *   - Persistência de IP/MAC/ID em NVS
+ *   - Cooldown de 3 minutos após reset (individual por dispositivo)
+ *   - Reset local do PC apenas após 3 tentativas consecutivas
  ***********************************************************************************************************************/
 
 // -------------------------------------------------------------------------------------------
@@ -51,27 +53,35 @@ extern "C" {
 // -------------------------------------------------------------------------------------------
 //                              Definições de ENDPOINT
 // -------------------------------------------------------------------------------------------
-#define STATUS_ENDPOINT        "https://iothub-v2-homolog.eletromidia.com.br/api/v1/reguas/pub"
-#define COMMAND_SUB_ENDPOINT   "https://iothub-v2-homolog.eletromidia.com.br/api/v1/reguas/sub"
-#define COMMAND_SUB_CONFIR     "https://iothub-v2-homolog.eletromidia.com.br/api/v1/reguas/subACK"
+#define STATUS_ENDPOINT        "https://iothub.eletromidia.com.br/api/v1/reguas/pub"
+#define COMMAND_SUB_ENDPOINT   "https://iothub.eletromidia.com.br/api/v1/reguas/sub"
+#define COMMAND_SUB_CONFIR     "https://iothub.eletromidia.com.br/api/v1/reguas/subACK"
 #define DEVICE_INFO_PATH       "/elemidia_v4/util/iot_hub/scripts/dispositivo.json"
 
-// IP DO SWITCH QUE DEVE SER IGNORADO
-#define SWITCH_IP_TO_IGNORE    "192.168.1.229"
+// -------------------------------------------------------------------------------------------
+//                          IPs QUE DEVEM SER IGNORADOS
+// -------------------------------------------------------------------------------------------
+const String IGNORED_IPS[] = {
+  "192.168.1.229",  // Switch
+  "192.168.1.237",  // IP a ignorar
+  "192.168.0.237"   // IP a ignorar
+};
+const int IGNORED_IPS_COUNT = 3;
 
 // -------------------------------------------------------------------------------------------
 //                          Configurações e Timeouts
 // -------------------------------------------------------------------------------------------
 #define STATUS_INTERVAL_MS          120000
-#define COMMAND_INTERVAL_MS         3000
+#define COMMAND_INTERVAL_MS         60000
 #define CONNECTIVITY_INTERVAL_MS    80000
 #define RESET_DURATION_MS           5000
-#define MODEM_RESET_MIN_INTERVAL_MS 180000
-#define PC_RESET_MIN_INTERVAL_MS    60000
-#define MODEM_COOLDOWN_AFTER_RESET  180000
-#define PC_COOLDOWN_AFTER_RESET     60000
+#define MODEM_RESET_MIN_INTERVAL_MS 300000
+#define PC_RESET_MIN_INTERVAL_MS    300000
+#define MODEM_COOLDOWN_AFTER_RESET  180000  // 3 MINUTOS
+#define PC_COOLDOWN_AFTER_RESET     180000  // 3 MINUTOS
 #define MAX_RETRY                   4
 #define MAX_CONSECUTIVE_FAILURES    7
+#define PC_MAX_FAILURES_BEFORE_RESET 3  // 3 TENTATIVAS ANTES DE RESETAR O PC
 #define EVENT_TYPE                  "keep_alive"
 #define DETAIL                      "regua-boe"
 #define HTTP_TIMEOUT_SHORT          2000
@@ -109,6 +119,9 @@ volatile bool externalPCReset    = false;
 bool pcResetOccurred    = false;
 bool modemResetOccurred = false;
 
+// Contador de falhas consecutivas do PC
+int pcConsecutiveFailures = 0;
+
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600, 60000);
 
@@ -122,6 +135,7 @@ String discoverPC();
 bool   validatePCIP(const IPAddress &ip);
 bool   arpProbe(const IPAddress &ip, String *macOut);
 bool   isInfrastructureHost(uint8_t last);
+bool   isIgnoredIP(const String &ip);
 void   savePC(const String &ip, const String &mac, const String &id);
 void   loadPC(String &ip, String &mac, String &id);
 void   clearSavedPC();
@@ -159,6 +173,16 @@ static String macToString(const uint8_t *m) {
 
 static struct netif* getEthNetif() {
   return netif_default;
+}
+
+// NOVA FUNÇÃO: Verifica se um IP está na lista de IPs a serem ignorados
+bool isIgnoredIP(const String &ip) {
+  for (int i = 0; i < IGNORED_IPS_COUNT; i++) {
+    if (ip == IGNORED_IPS[i]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool arpProbe(const IPAddress &ip, String *macOut) {
@@ -203,10 +227,9 @@ bool validatePCIP(const IPAddress &ip) {
   return true;
 }
 
-// MODIFICADA: Agora exclui 229 (switch)
 bool isInfrastructureHost(uint8_t last) {
   return (last == 0) || (last == 1) || (last == 254) || (last == 255) || 
-         (last == 201) || (last == 229);  // INCLUÍDO 229
+         (last == 201) || (last == 229);
 }
 
 String fetchDeviceID(const String &pcIP) {
@@ -263,7 +286,6 @@ void loadPC(String &ip, String &mac, String &id) {
   prefs.end();
 }
 
-// NOVA FUNÇÃO: Limpar dados salvos
 void clearSavedPC() {
   prefs.begin("smr", false);
   prefs.remove("pc_ip");
@@ -286,6 +308,7 @@ void connectivityTask(void *parameter) {
   for (;;) {
     esp_task_wdt_reset();
 
+    // ===== PROCESSAMENTO DE COMANDOS URGENTES =====
     if (externalModemReset || externalPCReset) {
       logMessage("[INFO]", "CONNECTIVITY", "COMANDO URGENTE DETECTADO - PROCESSANDO");
       if (externalModemReset) {
@@ -302,6 +325,7 @@ void connectivityTask(void *parameter) {
         if (!pcRelayState.relayActive && (millis() - pcRelayState.lastResetTime) > PC_RESET_MIN_INTERVAL_MS) {
           activateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
           pcResetOccurred = true;
+          pcConsecutiveFailures = 0;
           confirmarRecebimentoComando("K2=0", "Resetar PC");
         } else {
           confirmarRecebimentoComando("K2=0", "Reset PC negado - intervalo mínimo");
@@ -310,17 +334,22 @@ void connectivityTask(void *parameter) {
       }
     }
 
+    // ===== VERIFICAÇÃO PERIÓDICA DE CONECTIVIDADE =====
     if ((millis() - lastCheck) >= CONNECTIVITY_INTERVAL_MS) {
       lastCheck = millis();
       logMessage("[INFO]", "CONNECTIVITY", "Iniciando verificação de conectividade");
 
       esp_task_wdt_reset();
+
+      // ===== VERIFICAÇÃO DO MODEM (com cooldown individual) =====
       bool modemOk = true;
+      bool modemInCooldown = false;
 
       if (modemRelayState.lastResetTime > 0 &&
           (millis() - modemRelayState.lastResetTime) < MODEM_COOLDOWN_AFTER_RESET) {
+        modemInCooldown = true;
         unsigned long remainingCooldown = (MODEM_COOLDOWN_AFTER_RESET - (millis() - modemRelayState.lastResetTime)) / 1000;
-        logMessage("[INFO]", "CONNECTIVITY", "Modem em cooldown por mais " + String(remainingCooldown) + "s");
+        logMessage("[INFO]", "CONNECTIVITY", "Modem em COOLDOWN - Verificações suspensas por mais " + String(remainingCooldown) + "s");
       } else {
         modemOk = checkModemConnectivity();
         if (!modemOk) {
@@ -335,16 +364,16 @@ void connectivityTask(void *parameter) {
 
       esp_task_wdt_reset();
 
-      // MODIFICADO: Verifica se é o switch antes de processar
-      if (modemOk && pcIP.isEmpty()) {
+      // ===== DESCOBERTA DO PC (apenas se modem OK) =====
+      if (modemOk && pcIP.isEmpty() && !modemInCooldown) {
         logMessage("[INFO]", "CONNECTIVITY", "Descobrindo IP do PC (ARP-first)");
         pcIP = discoverPC();
         if (!pcIP.isEmpty()) {
-          // VERIFICA SE É O SWITCH
-          if (pcIP == SWITCH_IP_TO_IGNORE) {
-            logMessage("[ERROR]", "CONNECTIVITY", "Switch detectado como PC - Ignorando e limpando");
+          // VERIFICA SE É UM DOS IPs A IGNORAR
+          if (isIgnoredIP(pcIP)) {
+            logMessage("[ERROR]", "CONNECTIVITY", "IP na lista de exclusão detectado: " + pcIP + " - Ignorando e limpando");
             clearSavedPC();
-            pcIP = "";  // Força nova descoberta
+            pcIP = "";
           } else {
             logMessage("[INFO]", "CONNECTIVITY", "PC encontrado: " + pcIP + (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC));
             deviceID = fetchDeviceID(pcIP);
@@ -352,6 +381,7 @@ void connectivityTask(void *parameter) {
               logMessage("[INFO]", "CONNECTIVITY", "Device ID obtido: " + deviceID);
             }
             savePC(pcIP, pcMAC, deviceID);
+            pcConsecutiveFailures = 0;
           }
         } else {
           logMessage("[WARN]", "CONNECTIVITY", "PC não encontrado após timeout");
@@ -360,20 +390,39 @@ void connectivityTask(void *parameter) {
 
       esp_task_wdt_reset();
 
-      if (modemOk && !pcIP.isEmpty()) {
+      // ===== VERIFICAÇÃO DO PC (com cooldown individual e 3 tentativas) =====
+      bool pcInCooldown = false;
+      
+      if (modemOk && !pcIP.isEmpty() && !modemInCooldown) {
         if (pcRelayState.lastResetTime > 0 &&
             (millis() - pcRelayState.lastResetTime) < PC_COOLDOWN_AFTER_RESET) {
+          pcInCooldown = true;
           unsigned long remainingCooldown = (PC_COOLDOWN_AFTER_RESET - (millis() - pcRelayState.lastResetTime)) / 1000;
-          logMessage("[INFO]", "CONNECTIVITY", "PC em cooldown por mais " + String(remainingCooldown) + "s");
+          logMessage("[INFO]", "CONNECTIVITY", "PC em COOLDOWN - Verificações suspensas por mais " + String(remainingCooldown) + "s");
         } else {
-          if (!checkPCConnectivity()) {
-            logMessage("[WARN]", "CONNECTIVITY", "Problema detectado com o PC");
-            if (!pcRelayState.relayActive &&
-                (millis() - pcRelayState.lastResetTime) > PC_RESET_MIN_INTERVAL_MS) {
-              activateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
-              pcResetOccurred = true;
+          bool pcOk = checkPCConnectivity();
+          
+          if (!pcOk) {
+            pcConsecutiveFailures++;
+            logMessage("[WARN]", "CONNECTIVITY", "Problema detectado com o PC - Falha " + String(pcConsecutiveFailures) + "/" + String(PC_MAX_FAILURES_BEFORE_RESET));
+            
+            // Só reseta após 3 tentativas consecutivas
+            if (pcConsecutiveFailures >= PC_MAX_FAILURES_BEFORE_RESET) {
+              if (!pcRelayState.relayActive &&
+                  (millis() - pcRelayState.lastResetTime) > PC_RESET_MIN_INTERVAL_MS) {
+                logMessage("[ERROR]", "CONNECTIVITY", "PC offline após " + String(PC_MAX_FAILURES_BEFORE_RESET) + " tentativas - Executando reset");
+                activateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
+                pcResetOccurred = true;
+                pcConsecutiveFailures = 0;
+              }
             }
           } else {
+            // PC OK - reseta contador de falhas
+            if (pcConsecutiveFailures > 0) {
+              logMessage("[INFO]", "CONNECTIVITY", "PC restaurado - Resetando contador de falhas (estava em " + String(pcConsecutiveFailures) + ")");
+              pcConsecutiveFailures = 0;
+            }
+            
             if (deviceID.isEmpty()) {
               deviceID = fetchDeviceID(pcIP);
               if (!deviceID.isEmpty()) {
@@ -387,6 +436,7 @@ void connectivityTask(void *parameter) {
 
       esp_task_wdt_reset();
 
+      // ===== CONFIRMAÇÕES DE RESET =====
       if (modemResetOccurred) {
         confirmarRecebimentoComando("Local Reset K1=1", "Resetar Modem Localmente");
         modemResetOccurred = false;
@@ -396,13 +446,30 @@ void connectivityTask(void *parameter) {
         pcResetOccurred = false;
       }
       
-      String statusMsg = "Status: Modem=" + String(modemOk ? "OK" : "FAIL");
-      statusMsg += " | PC=" + (pcIP.isEmpty() ? "Não encontrado" : pcIP);
+      // ===== LOG DE STATUS =====
+      String statusMsg = "Status: Modem=";
+      if (modemInCooldown) {
+        statusMsg += "COOLDOWN";
+      } else {
+        statusMsg += (modemOk ? "OK" : "FAIL");
+      }
+      statusMsg += " | PC=";
+      if (pcIP.isEmpty()) {
+        statusMsg += "Não encontrado";
+      } else if (pcInCooldown) {
+        statusMsg += pcIP + " (COOLDOWN)";
+      } else {
+        statusMsg += pcIP;
+        if (pcConsecutiveFailures > 0) {
+          statusMsg += " (Falhas: " + String(pcConsecutiveFailures) + "/" + String(PC_MAX_FAILURES_BEFORE_RESET) + ")";
+        }
+      }
       statusMsg += " | ID=" + (deviceID.isEmpty() ? "Não obtido" : deviceID);
       logMessage("[INFO]", "CONNECTIVITY", statusMsg);
       logMessage("[INFO]", "CONNECTIVITY", "Verificação concluída");
     }
 
+    // ===== CONTROLE NÃO-BLOQUEANTE DOS RELÉS =====
     resetDeviceNonBlocking(RELAY_MODEM_PIN, RESET_DURATION_MS, &modemRelayState);
     resetDeviceNonBlocking(RELAY_PC_PIN,   RESET_DURATION_MS, &pcRelayState);
 
@@ -444,7 +511,7 @@ void commandsTask(void *parameter) {
 // -------------------------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  logMessage("[INFO]", "SYSTEM", "Inicializando Smart Ruler v1.9.2 (Switch Exclusion)");
+  logMessage("[INFO]", "SYSTEM", "Inicializando Smart Ruler v1.9.5 (Exclusão Múltipla de IPs)");
 
   pinMode(RELAY_MODEM_PIN, OUTPUT);
   pinMode(RELAY_PC_PIN,   OUTPUT);
@@ -487,12 +554,19 @@ void setup() {
   timeClient.update();
   randomSeed(micros());
 
-  // CRÍTICO: VERIFICA SE O IP SALVO É O SWITCH
+  // Log dos IPs que serão ignorados
+  String ignoredList = "";
+  for (int i = 0; i < IGNORED_IPS_COUNT; i++) {
+    if (i > 0) ignoredList += ", ";
+    ignoredList += IGNORED_IPS[i];
+  }
+  logMessage("[INFO]", "DISCOVERY", "IPs na lista de exclusão: " + ignoredList);
+
+  // VERIFICA SE O IP SALVO ESTÁ NA LISTA DE EXCLUSÃO
   loadPC(pcIP, pcMAC, deviceID);
   if (!pcIP.isEmpty()) {
-    // SE FOR O SWITCH, LIMPA TUDO
-    if (pcIP == SWITCH_IP_TO_IGNORE) {
-      logMessage("[WARN]", "DISCOVERY", "IP salvo é o switch conhecido - LIMPANDO DADOS");
+    if (isIgnoredIP(pcIP)) {
+      logMessage("[WARN]", "DISCOVERY", "IP salvo está na lista de exclusão: " + pcIP + " - LIMPANDO DADOS");
       clearSavedPC();
     } else {
       logMessage("[INFO]", "DISCOVERY", "PC salvo: " + pcIP + 
@@ -589,7 +663,6 @@ bool checkPCConnectivity() {
   return false;
 }
 
-// MODIFICADA: Ignora o switch durante descoberta
 String discoverPC() {
   const uint32_t TMAX = PC_DISCOVERY_TIMEOUT_MS;
   uint32_t t0 = millis();
@@ -601,9 +674,7 @@ String discoverPC() {
   uint8_t myLast = myIP[3];
 
   logMessage("[INFO]", "DISCOVERY", "ARP-first na sub-rede: " + String(base[0]) + "." + String(base[1]) + "." + String(base[2]) + ".x");
-  logMessage("[INFO]", "DISCOVERY", "IGNORANDO SWITCH: " + String(SWITCH_IP_TO_IGNORE));
 
-  // IPs comuns (sem 229!)
   const uint8_t commons[] = {20,21,22,23,24,25, 10,11,12,13, 30,50,
                              100,101,102,103,104,105, 120,150, 200,205,210,220,230,240};
   for (size_t i=0; i<sizeof(commons); ++i) {
@@ -613,9 +684,9 @@ String discoverPC() {
 
     IPAddress ip(base[0], base[1], base[2], h);
     
-    // VERIFICA SE É O SWITCH
-    if (ip.toString() == SWITCH_IP_TO_IGNORE) {
-      logMessage("[DEBUG]", "DISCOVERY", "Ignorando switch conhecido: " + ip.toString());
+    // VERIFICA SE É UM DOS IPs A IGNORAR
+    if (isIgnoredIP(ip.toString())) {
+      logMessage("[DEBUG]", "DISCOVERY", "Ignorando IP da lista de exclusão: " + ip.toString());
       continue;
     }
     
@@ -629,7 +700,6 @@ String discoverPC() {
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
   }
 
-  // Janela ao redor do próprio IP
   int start = max(2, (int)myLast - 32);
   int end   = min(253, (int)myLast + 32);
   for (int h = start; h <= end; ++h) {
@@ -638,9 +708,9 @@ String discoverPC() {
 
     IPAddress ip(base[0], base[1], base[2], (uint8_t)h);
     
-    // VERIFICA SE É O SWITCH
-    if (ip.toString() == SWITCH_IP_TO_IGNORE) {
-      logMessage("[DEBUG]", "DISCOVERY", "Ignorando switch conhecido: " + ip.toString());
+    // VERIFICA SE É UM DOS IPs A IGNORAR
+    if (isIgnoredIP(ip.toString())) {
+      logMessage("[DEBUG]", "DISCOVERY", "Ignorando IP da lista de exclusão: " + ip.toString());
       continue;
     }
     
@@ -653,16 +723,15 @@ String discoverPC() {
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
   }
 
-  // Varredura restante
   for (int h = 2; h <= 253; ++h) {
     if ((millis() - t0) > TMAX) { logMessage("[WARN]", "DISCOVERY", "Timeout no /24"); return ""; }
     if (h == myLast || isInfrastructureHost(h) || h == gwIP[3] || (h >= start && h <= end)) continue;
 
     IPAddress ip(base[0], base[1], base[2], (uint8_t)h);
     
-    // VERIFICA SE É O SWITCH
-    if (ip.toString() == SWITCH_IP_TO_IGNORE) {
-      logMessage("[DEBUG]", "DISCOVERY", "Ignorando switch conhecido: " + ip.toString());
+    // VERIFICA SE É UM DOS IPs A IGNORAR
+    if (isIgnoredIP(ip.toString())) {
+      logMessage("[DEBUG]", "DISCOVERY", "Ignorando IP da lista de exclusão: " + ip.toString());
       continue;
     }
     
