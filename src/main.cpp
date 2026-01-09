@@ -1,122 +1,125 @@
-/***********************************************Smart Ruler Firmware (ARP-first + Device ID)*****************************************
- * Autor: Henrique Rosa
+/***********************************************Smart Ruler Firmware (ARP-first
+ * + Device ID)***************************************** Autor: Henrique Rosa
  * Projeto: Smart Ruler (SMR)
- * Versão: 1.9.5 - Exclusão múltipla de IPs + 3 tentativas + Cooldown
- * Data: [Dez/2024]
+ * Versão: 1.9.9.1 - Atualização de payloads e documentação
+ * Data: [Jan/2026]
  * Foco desta versão:
  *   - Descoberta do PC por ARP (rápida e confiável)
- *   - EXCLUSÃO DE MÚLTIPLOS IPs: 192.168.1.229, 192.168.1.237, 192.168.0.237
+ *   - EXCLUSÃO DE MÚLTIPLOS IPs (Switch e outros)
  *   - Busca do ID do dispositivo via HTTP GET
  *   - Persistência de IP/MAC/ID em NVS
- *   - Cooldown de 3 minutos após reset (individual por dispositivo)
+ *   - Cooldown de 3 minutos após reset
  *   - Reset local do PC apenas após 3 tentativas consecutivas
+ *   - Padronização de Payloads (0/1) conforme documentação v1.9.9.1
  ***********************************************************************************************************************/
 
 // -------------------------------------------------------------------------------------------
 //  Bibliotecas Usadas
 // -------------------------------------------------------------------------------------------
-#include <ETH.h>
-#include <ESP32Ping.h>
-#include <WiFiUdp.h>
-#include <NTPClient.h>
-#include <HTTPClient.h>
-#include <Preferences.h>
-#include <esp_task_wdt.h>
 #include <ArduinoJson.h>
+#include <ESP32Ping.h>
+#include <ETH.h>
+#include <HTTPClient.h>
+#include <NTPClient.h>
+#include <Preferences.h>
+#include <WiFiUdp.h>
+#include <esp_task_wdt.h>
 
 extern "C" {
-  #include "lwip/err.h"
-  #include "lwip/ip4_addr.h"
-  #include "lwip/netif.h"
-  #include "lwip/etharp.h"
+#include "lwip/err.h"
+#include "lwip/etharp.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/netif.h"
 }
 
 // -------------------------------------------------------------------------------------------
 //                               Configurações Ethernet e Rede
 // -------------------------------------------------------------------------------------------
-#define ETH_PHY_ADDR        0
-#define ETH_PHY_POWER_PIN   -1
-#define ETH_PHY_MDC_PIN     23
-#define ETH_PHY_MDIO_PIN    18
-#undef  ETH_CLK_MODE
-#define ETH_CLK_MODE        ETH_CLOCK_GPIO17_OUT
-#define ETH_PHY_TYPE        ETH_PHY_LAN8720
+#define ETH_PHY_ADDR 0
+#define ETH_PHY_POWER_PIN -1
+#define ETH_PHY_MDC_PIN 23
+#define ETH_PHY_MDIO_PIN 18
+#undef ETH_CLK_MODE
+#define ETH_CLK_MODE ETH_CLOCK_GPIO17_OUT
+#define ETH_PHY_TYPE ETH_PHY_LAN8720
 
 // -------------------------------------------------------------------------------------------
 //                               Definições de pinos
 // -------------------------------------------------------------------------------------------
-#define RELAY_MODEM_PIN     14
-#define RELAY_PC_PIN        32
-#define RELAY_K3            12
-#define RELAY_K4            33
+#define RELAY_MODEM_PIN 14
+#define RELAY_PC_PIN 32
+#define RELAY_K3 12
+#define RELAY_K4 33
 
 // -------------------------------------------------------------------------------------------
 //                              Definições de ENDPOINT
 // -------------------------------------------------------------------------------------------
-#define STATUS_ENDPOINT        "https://iothub.eletromidia.com.br/api/v1/reguas/pub"
-#define COMMAND_SUB_ENDPOINT   "https://iothub.eletromidia.com.br/api/v1/reguas/sub"
-#define COMMAND_SUB_CONFIR     "https://iothub.eletromidia.com.br/api/v1/reguas/subACK"
-#define DEVICE_INFO_PATH       "/elemidia_v4/util/iot_hub/scripts/dispositivo.json"
+#define STATUS_ENDPOINT "https://iothub.eletromidia.com.br/api/v1/reguas/pub"
+#define COMMAND_SUB_ENDPOINT                                                   \
+  "https://iothub.eletromidia.com.br/api/v1/reguas/sub"
+#define COMMAND_SUB_CONFIR                                                     \
+  "https://iothub.eletromidia.com.br/api/v1/reguas/subACK"
+#define DEVICE_INFO_PATH "/elemidia_v4/util/iot_hub/scripts/dispositivo.json"
 
 // -------------------------------------------------------------------------------------------
 //                          IPs QUE DEVEM SER IGNORADOS
 // -------------------------------------------------------------------------------------------
 const String IGNORED_IPS[] = {
-  "192.168.1.229",  // Switch
-  "192.168.1.237",  // IP a ignorar
-  "192.168.0.237"   // IP a ignorar
+    "192.168.1.229", // Switch
+    "192.168.1.237", // IP a ignorar
+    "192.168.0.237"  // IP a ignorar
 };
 const int IGNORED_IPS_COUNT = 3;
 
 // -------------------------------------------------------------------------------------------
 //                          Configurações e Timeouts
 // -------------------------------------------------------------------------------------------
-#define STATUS_INTERVAL_MS          120000
-#define COMMAND_INTERVAL_MS         60000
-#define CONNECTIVITY_INTERVAL_MS    80000
-#define RESET_DURATION_MS           5000
+#define STATUS_INTERVAL_MS 120000
+#define COMMAND_INTERVAL_MS 60000
+#define CONNECTIVITY_INTERVAL_MS 80000
+#define RESET_DURATION_MS 5000
 #define MODEM_RESET_MIN_INTERVAL_MS 300000
-#define PC_RESET_MIN_INTERVAL_MS    300000
-#define MODEM_COOLDOWN_AFTER_RESET  180000  // 3 MINUTOS
-#define PC_COOLDOWN_AFTER_RESET     180000  // 3 MINUTOS
-#define MAX_RETRY                   4
-#define MAX_CONSECUTIVE_FAILURES    7
-#define PC_MAX_FAILURES_BEFORE_RESET 3  // 3 TENTATIVAS ANTES DE RESETAR O PC
-#define EVENT_TYPE                  "keep_alive"
-#define DETAIL                      "regua-boe"
-#define HTTP_TIMEOUT_SHORT          2000
-#define HTTP_TIMEOUT_MEDIUM         4000
-#define PC_DISCOVERY_TIMEOUT_MS     25000
-#define PC_DISCOVERY_STEP_DELAY     8
-#define ARP_REPLY_WAIT_MS           28
-#define WDT_TIMEOUT                 45
+#define PC_RESET_MIN_INTERVAL_MS 300000
+#define MODEM_COOLDOWN_AFTER_RESET 180000 // 3 MINUTOS
+#define PC_COOLDOWN_AFTER_RESET 180000    // 3 MINUTOS
+#define MAX_RETRY 4
+#define MAX_CONSECUTIVE_FAILURES 7
+#define PC_MAX_FAILURES_BEFORE_RESET 3 // 3 TENTATIVAS ANTES DE RESETAR O PC
+#define EVENT_TYPE "keep_alive"
+#define DETAIL "regua-boe"
+#define HTTP_TIMEOUT_SHORT 2000
+#define HTTP_TIMEOUT_MEDIUM 4000
+#define PC_DISCOVERY_TIMEOUT_MS 25000
+#define PC_DISCOVERY_STEP_DELAY 8
+#define ARP_REPLY_WAIT_MS 28
+#define WDT_TIMEOUT 45
 
 // -------------------------------------------------------------------------------------------
 //                              Estruturas
 // -------------------------------------------------------------------------------------------
 struct RelayResetState {
   unsigned long startTime;
-  bool          relayActive;
+  bool relayActive;
   unsigned long lastResetTime;
-  int           resetCount;
+  int resetCount;
 };
 
 // -------------------------------------------------------------------------------------------
 //                              Variáveis Globais
 // -------------------------------------------------------------------------------------------
 String modemIP = "";
-String pcIP    = "";
-String pcMAC   = "";
+String pcIP = "";
+String pcMAC = "";
 String deviceMAC = "";
 String deviceID = "";
 Preferences prefs;
 
 RelayResetState modemRelayState = {0, false, 0, 0};
-RelayResetState pcRelayState    = {0, false, 0, 0};
+RelayResetState pcRelayState = {0, false, 0, 0};
 
 volatile bool externalModemReset = false;
-volatile bool externalPCReset    = false;
-bool pcResetOccurred    = false;
+volatile bool externalPCReset = false;
+bool pcResetOccurred = false;
 bool modemResetOccurred = false;
 
 // Contador de falhas consecutivas do PC
@@ -128,32 +131,39 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600, 60000);
 // -------------------------------------------------------------------------------------------
 //                              Protótipos de Funções
 // -------------------------------------------------------------------------------------------
-void   logMessage(const String &level, const String &tag, const String &message);
-bool   checkModemConnectivity();
-bool   checkPCConnectivity();
+void logMessage(const String &level, const String &tag, const String &message);
+bool checkModemConnectivity();
+bool checkPCConnectivity();
 String discoverPC();
-bool   validatePCIP(const IPAddress &ip);
-bool   arpProbe(const IPAddress &ip, String *macOut);
-bool   isInfrastructureHost(uint8_t last);
-bool   isIgnoredIP(const String &ip);
-void   savePC(const String &ip, const String &mac, const String &id);
-void   loadPC(String &ip, String &mac, String &id);
-void   clearSavedPC();
+bool validatePCIP(const IPAddress &ip);
+bool arpProbe(const IPAddress &ip, String *macOut);
+bool isInfrastructureHost(uint8_t last);
+bool isIgnoredIP(const String &ip);
+void savePC(const String &ip, const String &mac, const String &id);
+void loadPC(String &ip, String &mac, String &id);
+void clearSavedPC();
 String fetchDeviceID(const String &pcIP);
-void   activateRelay(int relayPin, RelayResetState* state, const String &relayName);
-void   deactivateRelay(int relayPin, RelayResetState* state, const String &relayName);
-void   resetDeviceNonBlocking(int relayPin, unsigned long delayTime, RelayResetState* state);
-void   sendStatusToEndpoint();
-void   handleCommandsFromEndpoint();
+void activateRelay(int relayPin, RelayResetState *state,
+                   const String &relayName);
+void deactivateRelay(int relayPin, RelayResetState *state,
+                     const String &relayName);
+void resetDeviceNonBlocking(int relayPin, unsigned long delayTime,
+                            RelayResetState *state);
+void sendStatusToEndpoint();
+void handleCommandsFromEndpoint();
 String obterTimestamp();
-void   confirmarRecebimentoComando(const String &comando, const String &descricao);
+void confirmarRecebimentoComando(const String &comando,
+                                 const String &descricao);
 String getPCMacAddress();
 
 // -------------------------------------------------------------------------------------------
 //                              Funções Utilitárias
 // -------------------------------------------------------------------------------------------
 void logMessage(const String &level, const String &tag, const String &message) {
-  Serial.print(level); Serial.print(" ["); Serial.print(tag); Serial.print("] ");
+  Serial.print(level);
+  Serial.print(" [");
+  Serial.print(tag);
+  Serial.print("] ");
   Serial.println(message);
 }
 
@@ -167,13 +177,12 @@ String getPCMacAddress() {
 
 static String macToString(const uint8_t *m) {
   char buf[18];
-  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", m[0],m[1],m[2],m[3],m[4],m[5]);
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2],
+           m[3], m[4], m[5]);
   return String(buf);
 }
 
-static struct netif* getEthNetif() {
-  return netif_default;
-}
+static struct netif *getEthNetif() { return netif_default; }
 
 // NOVA FUNÇÃO: Verifica se um IP está na lista de IPs a serem ignorados
 bool isIgnoredIP(const String &ip) {
@@ -187,7 +196,8 @@ bool isIgnoredIP(const String &ip) {
 
 bool arpProbe(const IPAddress &ip, String *macOut) {
   struct netif *nif = getEthNetif();
-  if (!nif) return false;
+  if (!nif)
+    return false;
 
   ip4_addr_t addr;
   IP4_ADDR(&addr, ip[0], ip[1], ip[2], ip[3]);
@@ -196,7 +206,8 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
   const ip4_addr_t *ip_ret = nullptr;
   s8_t r = etharp_find_addr(nif, &addr, &eth_ret, &ip_ret);
   if (r >= 0 && eth_ret) {
-    if (macOut) *macOut = macToString(eth_ret->addr);
+    if (macOut)
+      *macOut = macToString(eth_ret->addr);
     return true;
   }
 
@@ -205,7 +216,8 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
   while ((millis() - t0) < ARP_REPLY_WAIT_MS) {
     r = etharp_find_addr(nif, &addr, &eth_ret, &ip_ret);
     if (r >= 0 && eth_ret) {
-      if (macOut) *macOut = macToString(eth_ret->addr);
+      if (macOut)
+        *macOut = macToString(eth_ret->addr);
       return true;
     }
     delay(2);
@@ -216,40 +228,43 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
 bool validatePCIP(const IPAddress &ip) {
   String mac;
   bool ok = arpProbe(ip, &mac);
-  if (!ok) return false;
-  
+  if (!ok)
+    return false;
+
   pcMAC = mac;
-  
+
   bool icmp = Ping.ping(ip, 1);
   if (!icmp) {
-    logMessage("[WARN]", "DISCOVERY", "ARP OK, ICMP falhou (possível filtro). Aceitando por ARP.");
+    logMessage("[WARN]", "DISCOVERY",
+               "ARP OK, ICMP falhou (possível filtro). Aceitando por ARP.");
   }
   return true;
 }
 
 bool isInfrastructureHost(uint8_t last) {
-  return (last == 0) || (last == 1) || (last == 254) || (last == 255) || 
+  return (last == 0) || (last == 1) || (last == 254) || (last == 255) ||
          (last == 201) || (last == 229);
 }
 
 String fetchDeviceID(const String &pcIP) {
-  if (pcIP.isEmpty()) return "";
-  
+  if (pcIP.isEmpty())
+    return "";
+
   String url = "http://" + pcIP + DEVICE_INFO_PATH;
   logMessage("[INFO]", "DEVICE_ID", "Buscando ID em: " + url);
-  
+
   HTTPClient http;
   http.begin(url);
   http.setTimeout(HTTP_TIMEOUT_SHORT);
-  
+
   int httpResponseCode = http.GET();
   String id = "";
-  
+
   if (httpResponseCode == 200) {
     String response = http.getString();
     StaticJsonDocument<512> doc;
     DeserializationError error = deserializeJson(doc, response);
-    
+
     if (!error) {
       if (doc.containsKey("id")) {
         id = doc["id"].as<String>();
@@ -258,21 +273,23 @@ String fetchDeviceID(const String &pcIP) {
         logMessage("[WARN]", "DEVICE_ID", "Campo 'id' não encontrado no JSON");
       }
     } else {
-      logMessage("[ERROR]", "DEVICE_ID", "Erro ao fazer parse do JSON: " + String(error.c_str()));
+      logMessage("[ERROR]", "DEVICE_ID",
+                 "Erro ao fazer parse do JSON: " + String(error.c_str()));
     }
   } else if (httpResponseCode > 0) {
-    logMessage("[WARN]", "DEVICE_ID", "HTTP Response: " + String(httpResponseCode));
+    logMessage("[WARN]", "DEVICE_ID",
+               "HTTP Response: " + String(httpResponseCode));
   } else {
     logMessage("[ERROR]", "DEVICE_ID", "Falha na requisição HTTP");
   }
-  
+
   http.end();
   return id;
 }
 
 void savePC(const String &ip, const String &mac, const String &id) {
   prefs.begin("smr", false);
-  prefs.putString("pc_ip",  ip);
+  prefs.putString("pc_ip", ip);
   prefs.putString("pc_mac", mac);
   prefs.putString("pc_id", id);
   prefs.end();
@@ -280,9 +297,9 @@ void savePC(const String &ip, const String &mac, const String &id) {
 
 void loadPC(String &ip, String &mac, String &id) {
   prefs.begin("smr", true);
-  ip  = prefs.getString("pc_ip", "");
+  ip = prefs.getString("pc_ip", "");
   mac = prefs.getString("pc_mac", "");
-  id  = prefs.getString("pc_id", "");
+  id = prefs.getString("pc_id", "");
   prefs.end();
 }
 
@@ -310,25 +327,32 @@ void connectivityTask(void *parameter) {
 
     // ===== PROCESSAMENTO DE COMANDOS URGENTES =====
     if (externalModemReset || externalPCReset) {
-      logMessage("[INFO]", "CONNECTIVITY", "COMANDO URGENTE DETECTADO - PROCESSANDO");
+      logMessage("[INFO]", "CONNECTIVITY",
+                 "COMANDO URGENTE DETECTADO - PROCESSANDO");
       if (externalModemReset) {
-        if (!modemRelayState.relayActive && (millis() - modemRelayState.lastResetTime) > MODEM_RESET_MIN_INTERVAL_MS) {
+        if (!modemRelayState.relayActive &&
+            (millis() - modemRelayState.lastResetTime) >
+                MODEM_RESET_MIN_INTERVAL_MS) {
           activateRelay(RELAY_MODEM_PIN, &modemRelayState, "Modem");
           modemResetOccurred = true;
           confirmarRecebimentoComando("K1=0", "Resetar Modem");
         } else {
-          confirmarRecebimentoComando("K1=0", "Reset modem negado - intervalo mínimo");
+          confirmarRecebimentoComando("K1=0",
+                                      "Reset modem negado - intervalo mínimo");
         }
         externalModemReset = false;
       }
       if (externalPCReset) {
-        if (!pcRelayState.relayActive && (millis() - pcRelayState.lastResetTime) > PC_RESET_MIN_INTERVAL_MS) {
+        if (!pcRelayState.relayActive &&
+            (millis() - pcRelayState.lastResetTime) >
+                PC_RESET_MIN_INTERVAL_MS) {
           activateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
           pcResetOccurred = true;
           pcConsecutiveFailures = 0;
           confirmarRecebimentoComando("K2=0", "Resetar PC");
         } else {
-          confirmarRecebimentoComando("K2=0", "Reset PC negado - intervalo mínimo");
+          confirmarRecebimentoComando("K2=0",
+                                      "Reset PC negado - intervalo mínimo");
         }
         externalPCReset = false;
       }
@@ -337,7 +361,8 @@ void connectivityTask(void *parameter) {
     // ===== VERIFICAÇÃO PERIÓDICA DE CONECTIVIDADE =====
     if ((millis() - lastCheck) >= CONNECTIVITY_INTERVAL_MS) {
       lastCheck = millis();
-      logMessage("[INFO]", "CONNECTIVITY", "Iniciando verificação de conectividade");
+      logMessage("[INFO]", "CONNECTIVITY",
+                 "Iniciando verificação de conectividade");
 
       esp_task_wdt_reset();
 
@@ -346,16 +371,24 @@ void connectivityTask(void *parameter) {
       bool modemInCooldown = false;
 
       if (modemRelayState.lastResetTime > 0 &&
-          (millis() - modemRelayState.lastResetTime) < MODEM_COOLDOWN_AFTER_RESET) {
+          (millis() - modemRelayState.lastResetTime) <
+              MODEM_COOLDOWN_AFTER_RESET) {
         modemInCooldown = true;
-        unsigned long remainingCooldown = (MODEM_COOLDOWN_AFTER_RESET - (millis() - modemRelayState.lastResetTime)) / 1000;
-        logMessage("[INFO]", "CONNECTIVITY", "Modem em COOLDOWN - Verificações suspensas por mais " + String(remainingCooldown) + "s");
+        unsigned long remainingCooldown =
+            (MODEM_COOLDOWN_AFTER_RESET -
+             (millis() - modemRelayState.lastResetTime)) /
+            1000;
+        logMessage("[INFO]", "CONNECTIVITY",
+                   "Modem em COOLDOWN - Verificações suspensas por mais " +
+                       String(remainingCooldown) + "s");
       } else {
         modemOk = checkModemConnectivity();
         if (!modemOk) {
-          logMessage("[WARN]", "CONNECTIVITY", "Problema detectado com o modem");
+          logMessage("[WARN]", "CONNECTIVITY",
+                     "Problema detectado com o modem");
           if (!modemRelayState.relayActive &&
-              (millis() - modemRelayState.lastResetTime) > MODEM_RESET_MIN_INTERVAL_MS) {
+              (millis() - modemRelayState.lastResetTime) >
+                  MODEM_RESET_MIN_INTERVAL_MS) {
             activateRelay(RELAY_MODEM_PIN, &modemRelayState, "Modem");
             modemResetOccurred = true;
           }
@@ -366,25 +399,32 @@ void connectivityTask(void *parameter) {
 
       // ===== DESCOBERTA DO PC (apenas se modem OK) =====
       if (modemOk && pcIP.isEmpty() && !modemInCooldown) {
-        logMessage("[INFO]", "CONNECTIVITY", "Descobrindo IP do PC (ARP-first)");
+        logMessage("[INFO]", "CONNECTIVITY",
+                   "Descobrindo IP do PC (ARP-first)");
         pcIP = discoverPC();
         if (!pcIP.isEmpty()) {
           // VERIFICA SE É UM DOS IPs A IGNORAR
           if (isIgnoredIP(pcIP)) {
-            logMessage("[ERROR]", "CONNECTIVITY", "IP na lista de exclusão detectado: " + pcIP + " - Ignorando e limpando");
+            logMessage("[ERROR]", "CONNECTIVITY",
+                       "IP na lista de exclusão detectado: " + pcIP +
+                           " - Ignorando e limpando");
             clearSavedPC();
             pcIP = "";
           } else {
-            logMessage("[INFO]", "CONNECTIVITY", "PC encontrado: " + pcIP + (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC));
+            logMessage("[INFO]", "CONNECTIVITY",
+                       "PC encontrado: " + pcIP +
+                           (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC));
             deviceID = fetchDeviceID(pcIP);
             if (!deviceID.isEmpty()) {
-              logMessage("[INFO]", "CONNECTIVITY", "Device ID obtido: " + deviceID);
+              logMessage("[INFO]", "CONNECTIVITY",
+                         "Device ID obtido: " + deviceID);
             }
             savePC(pcIP, pcMAC, deviceID);
             pcConsecutiveFailures = 0;
           }
         } else {
-          logMessage("[WARN]", "CONNECTIVITY", "PC não encontrado após timeout");
+          logMessage("[WARN]", "CONNECTIVITY",
+                     "PC não encontrado após timeout");
         }
       }
 
@@ -392,25 +432,37 @@ void connectivityTask(void *parameter) {
 
       // ===== VERIFICAÇÃO DO PC (com cooldown individual e 3 tentativas) =====
       bool pcInCooldown = false;
-      
+
       if (modemOk && !pcIP.isEmpty() && !modemInCooldown) {
         if (pcRelayState.lastResetTime > 0 &&
             (millis() - pcRelayState.lastResetTime) < PC_COOLDOWN_AFTER_RESET) {
           pcInCooldown = true;
-          unsigned long remainingCooldown = (PC_COOLDOWN_AFTER_RESET - (millis() - pcRelayState.lastResetTime)) / 1000;
-          logMessage("[INFO]", "CONNECTIVITY", "PC em COOLDOWN - Verificações suspensas por mais " + String(remainingCooldown) + "s");
+          unsigned long remainingCooldown =
+              (PC_COOLDOWN_AFTER_RESET -
+               (millis() - pcRelayState.lastResetTime)) /
+              1000;
+          logMessage("[INFO]", "CONNECTIVITY",
+                     "PC em COOLDOWN - Verificações suspensas por mais " +
+                         String(remainingCooldown) + "s");
         } else {
           bool pcOk = checkPCConnectivity();
-          
+
           if (!pcOk) {
             pcConsecutiveFailures++;
-            logMessage("[WARN]", "CONNECTIVITY", "Problema detectado com o PC - Falha " + String(pcConsecutiveFailures) + "/" + String(PC_MAX_FAILURES_BEFORE_RESET));
-            
+            logMessage("[WARN]", "CONNECTIVITY",
+                       "Problema detectado com o PC - Falha " +
+                           String(pcConsecutiveFailures) + "/" +
+                           String(PC_MAX_FAILURES_BEFORE_RESET));
+
             // Só reseta após 3 tentativas consecutivas
             if (pcConsecutiveFailures >= PC_MAX_FAILURES_BEFORE_RESET) {
               if (!pcRelayState.relayActive &&
-                  (millis() - pcRelayState.lastResetTime) > PC_RESET_MIN_INTERVAL_MS) {
-                logMessage("[ERROR]", "CONNECTIVITY", "PC offline após " + String(PC_MAX_FAILURES_BEFORE_RESET) + " tentativas - Executando reset");
+                  (millis() - pcRelayState.lastResetTime) >
+                      PC_RESET_MIN_INTERVAL_MS) {
+                logMessage("[ERROR]", "CONNECTIVITY",
+                           "PC offline após " +
+                               String(PC_MAX_FAILURES_BEFORE_RESET) +
+                               " tentativas - Executando reset");
                 activateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
                 pcResetOccurred = true;
                 pcConsecutiveFailures = 0;
@@ -419,14 +471,18 @@ void connectivityTask(void *parameter) {
           } else {
             // PC OK - reseta contador de falhas
             if (pcConsecutiveFailures > 0) {
-              logMessage("[INFO]", "CONNECTIVITY", "PC restaurado - Resetando contador de falhas (estava em " + String(pcConsecutiveFailures) + ")");
+              logMessage(
+                  "[INFO]", "CONNECTIVITY",
+                  "PC restaurado - Resetando contador de falhas (estava em " +
+                      String(pcConsecutiveFailures) + ")");
               pcConsecutiveFailures = 0;
             }
-            
+
             if (deviceID.isEmpty()) {
               deviceID = fetchDeviceID(pcIP);
               if (!deviceID.isEmpty()) {
-                logMessage("[INFO]", "CONNECTIVITY", "Device ID obtido na reverificação: " + deviceID);
+                logMessage("[INFO]", "CONNECTIVITY",
+                           "Device ID obtido na reverificação: " + deviceID);
                 savePC(pcIP, pcMAC, deviceID);
               }
             }
@@ -438,14 +494,16 @@ void connectivityTask(void *parameter) {
 
       // ===== CONFIRMAÇÕES DE RESET =====
       if (modemResetOccurred) {
-        confirmarRecebimentoComando("Local Reset K1=1", "Resetar Modem Localmente");
+        confirmarRecebimentoComando("Local Reset K1=1",
+                                    "Resetar Modem Localmente");
         modemResetOccurred = false;
       }
       if (pcResetOccurred) {
-        confirmarRecebimentoComando("Local Reset K2=1", "Resetar PC Localmente");
+        confirmarRecebimentoComando("Local Reset K2=1",
+                                    "Resetar PC Localmente");
         pcResetOccurred = false;
       }
-      
+
       // ===== LOG DE STATUS =====
       String statusMsg = "Status: Modem=";
       if (modemInCooldown) {
@@ -461,7 +519,8 @@ void connectivityTask(void *parameter) {
       } else {
         statusMsg += pcIP;
         if (pcConsecutiveFailures > 0) {
-          statusMsg += " (Falhas: " + String(pcConsecutiveFailures) + "/" + String(PC_MAX_FAILURES_BEFORE_RESET) + ")";
+          statusMsg += " (Falhas: " + String(pcConsecutiveFailures) + "/" +
+                       String(PC_MAX_FAILURES_BEFORE_RESET) + ")";
         }
       }
       statusMsg += " | ID=" + (deviceID.isEmpty() ? "Não obtido" : deviceID);
@@ -470,8 +529,9 @@ void connectivityTask(void *parameter) {
     }
 
     // ===== CONTROLE NÃO-BLOQUEANTE DOS RELÉS =====
-    resetDeviceNonBlocking(RELAY_MODEM_PIN, RESET_DURATION_MS, &modemRelayState);
-    resetDeviceNonBlocking(RELAY_PC_PIN,   RESET_DURATION_MS, &pcRelayState);
+    resetDeviceNonBlocking(RELAY_MODEM_PIN, RESET_DURATION_MS,
+                           &modemRelayState);
+    resetDeviceNonBlocking(RELAY_PC_PIN, RESET_DURATION_MS, &pcRelayState);
 
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_task_wdt_reset();
@@ -511,20 +571,22 @@ void commandsTask(void *parameter) {
 // -------------------------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  logMessage("[INFO]", "SYSTEM", "Inicializando Smart Ruler v1.9.5 (Exclusão Múltipla de IPs)");
+  logMessage("[INFO]", "SYSTEM",
+             "Inicializando Smart Ruler v1.9.9.1 (Padronização de Payloads)");
 
   pinMode(RELAY_MODEM_PIN, OUTPUT);
-  pinMode(RELAY_PC_PIN,   OUTPUT);
-  pinMode(RELAY_K3,       OUTPUT);
-  pinMode(RELAY_K4,       OUTPUT);
+  pinMode(RELAY_PC_PIN, OUTPUT);
+  pinMode(RELAY_K3, OUTPUT);
+  pinMode(RELAY_K4, OUTPUT);
   digitalWrite(RELAY_MODEM_PIN, LOW);
-  digitalWrite(RELAY_PC_PIN,   LOW);
-  digitalWrite(RELAY_K3,       LOW);
-  digitalWrite(RELAY_K4,       LOW);
+  digitalWrite(RELAY_PC_PIN, LOW);
+  digitalWrite(RELAY_K3, LOW);
+  digitalWrite(RELAY_K4, LOW);
 
   esp_task_wdt_init(WDT_TIMEOUT, true);
 
-  if (!ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER_PIN, ETH_PHY_MDC_PIN, ETH_PHY_MDIO_PIN, ETH_PHY_TYPE, ETH_CLK_MODE)) {
+  if (!ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER_PIN, ETH_PHY_MDC_PIN,
+                 ETH_PHY_MDIO_PIN, ETH_PHY_TYPE, ETH_CLK_MODE)) {
     logMessage("[ERROR]", "NETWORK", "Falha ao inicializar Ethernet");
     ESP.restart();
   }
@@ -544,7 +606,8 @@ void setup() {
   IPAddress gw = ETH.gatewayIP();
   if (gw == INADDR_NONE) {
     modemIP = "192.168.0.1";
-    logMessage("[WARN]", "NETWORK", "Gateway não encontrado, usando fallback: " + modemIP);
+    logMessage("[WARN]", "NETWORK",
+               "Gateway não encontrado, usando fallback: " + modemIP);
   } else {
     modemIP = gw.toString();
     logMessage("[INFO]", "NETWORK", "Gateway encontrado: " + modemIP);
@@ -557,7 +620,8 @@ void setup() {
   // Log dos IPs que serão ignorados
   String ignoredList = "";
   for (int i = 0; i < IGNORED_IPS_COUNT; i++) {
-    if (i > 0) ignoredList += ", ";
+    if (i > 0)
+      ignoredList += ", ";
     ignoredList += IGNORED_IPS[i];
   }
   logMessage("[INFO]", "DISCOVERY", "IPs na lista de exclusão: " + ignoredList);
@@ -566,15 +630,20 @@ void setup() {
   loadPC(pcIP, pcMAC, deviceID);
   if (!pcIP.isEmpty()) {
     if (isIgnoredIP(pcIP)) {
-      logMessage("[WARN]", "DISCOVERY", "IP salvo está na lista de exclusão: " + pcIP + " - LIMPANDO DADOS");
+      logMessage("[WARN]", "DISCOVERY",
+                 "IP salvo está na lista de exclusão: " + pcIP +
+                     " - LIMPANDO DADOS");
       clearSavedPC();
     } else {
-      logMessage("[INFO]", "DISCOVERY", "PC salvo: " + pcIP + 
-                 (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC) +
-                 (deviceID.isEmpty() ? "" : "  ID=" + deviceID));
-      IPAddress ip; ip.fromString(pcIP);
+      logMessage("[INFO]", "DISCOVERY",
+                 "PC salvo: " + pcIP +
+                     (pcMAC.isEmpty() ? "" : "  MAC=" + pcMAC) +
+                     (deviceID.isEmpty() ? "" : "  ID=" + deviceID));
+      IPAddress ip;
+      ip.fromString(pcIP);
       if (!validatePCIP(ip)) {
-        logMessage("[WARN]", "DISCOVERY", "PC salvo inválido. Nova descoberta será necessária.");
+        logMessage("[WARN]", "DISCOVERY",
+                   "PC salvo inválido. Nova descoberta será necessária.");
         clearSavedPC();
       } else if (deviceID.isEmpty()) {
         deviceID = fetchDeviceID(pcIP);
@@ -585,16 +654,15 @@ void setup() {
     }
   }
 
-  xTaskCreatePinnedToCore(connectivityTask, "ConnectivityTask", 8192, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(statusTask,       "StatusTask",       6144, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(commandsTask,     "CommandsTask",     6144, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(connectivityTask, "ConnectivityTask", 8192, NULL, 2,
+                          NULL, 0);
+  xTaskCreatePinnedToCore(statusTask, "StatusTask", 6144, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(commandsTask, "CommandsTask", 6144, NULL, 3, NULL, 1);
 
   logMessage("[INFO]", "SYSTEM", "Sistema inicializado com sucesso");
 }
 
-void loop() {
-  vTaskDelay(pdMS_TO_TICKS(10000));
-}
+void loop() { vTaskDelay(pdMS_TO_TICKS(10000)); }
 
 // -------------------------------------------------------------------------------------------
 //                          Funções de Conectividade
@@ -607,44 +675,57 @@ bool checkModemConnectivity() {
   logMessage("[DEBUG]", "MODEM", "Verificando conectividade: " + modemIP);
 
   for (int i = 0; i < MAX_RETRY; i++) {
-    if (Ping.ping(modemIP.c_str())) { localConnectionOk = true; break; }
+    if (Ping.ping(modemIP.c_str())) {
+      localConnectionOk = true;
+      break;
+    }
     vTaskDelay(pdMS_TO_TICKS(250));
   }
 
   if (localConnectionOk) {
     for (int i = 0; i < MAX_RETRY; i++) {
-      if (Ping.ping("8.8.8.8")) { internetConnectionOk = true; break; }
+      if (Ping.ping("8.8.8.8")) {
+        internetConnectionOk = true;
+        break;
+      }
       vTaskDelay(pdMS_TO_TICKS(250));
     }
   }
 
   if (!localConnectionOk || !internetConnectionOk) {
     consecutiveFailures++;
-    logMessage("[WARN]", "MODEM", "Falha na conectividade. Consecutivas: " + String(consecutiveFailures));
+    logMessage("[WARN]", "MODEM",
+               "Falha na conectividade. Consecutivas: " +
+                   String(consecutiveFailures));
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      logMessage("[ERROR]", "MODEM", "Excesso de falhas consecutivas - Reiniciando ESP");
+      logMessage("[ERROR]", "MODEM",
+                 "Excesso de falhas consecutivas - Reiniciando ESP");
       vTaskDelay(pdMS_TO_TICKS(500));
       ESP.restart();
     }
     return false;
   } else {
-    if (consecutiveFailures > 0) logMessage("[INFO]", "MODEM", "Conectividade restaurada");
+    if (consecutiveFailures > 0)
+      logMessage("[INFO]", "MODEM", "Conectividade restaurada");
     consecutiveFailures = 0;
     return true;
   }
 }
 
 bool checkPCConnectivity() {
-  if (pcIP.isEmpty()) return false;
+  if (pcIP.isEmpty())
+    return false;
 
   logMessage("[DEBUG]", "PC", "Verificando conectividade: " + pcIP);
 
-  IPAddress ip; ip.fromString(pcIP);
+  IPAddress ip;
+  ip.fromString(pcIP);
   String mac;
   bool arpOk = arpProbe(ip, &mac);
   if (arpOk && !pcMAC.isEmpty() && !mac.isEmpty() && (mac != pcMAC)) {
-    logMessage("[WARN]", "PC", "MAC diferente do persistido. Atualizando registro.");
-    pcMAC = mac; 
+    logMessage("[WARN]", "PC",
+               "MAC diferente do persistido. Atualizando registro.");
+    pcMAC = mac;
     savePC(pcIP, pcMAC, deviceID);
   }
 
@@ -657,7 +738,8 @@ bool checkPCConnectivity() {
   }
 
   bool icmp = Ping.ping(ip, 1);
-  if (icmp) return true;
+  if (icmp)
+    return true;
 
   logMessage("[WARN]", "PC", "PC offline (ARP e ICMP falharam)");
   return false;
@@ -673,72 +755,100 @@ String discoverPC() {
   IPAddress base(myIP[0], myIP[1], myIP[2], 0);
   uint8_t myLast = myIP[3];
 
-  logMessage("[INFO]", "DISCOVERY", "ARP-first na sub-rede: " + String(base[0]) + "." + String(base[1]) + "." + String(base[2]) + ".x");
+  logMessage("[INFO]", "DISCOVERY",
+             "ARP-first na sub-rede: " + String(base[0]) + "." +
+                 String(base[1]) + "." + String(base[2]) + ".x");
 
-  const uint8_t commons[] = {20,21,22,23,24,25, 10,11,12,13, 30,50,
-                             100,101,102,103,104,105, 120,150, 200,205,210,220,230,240};
-  for (size_t i=0; i<sizeof(commons); ++i) {
-    if ((millis() - t0) > TMAX) { logMessage("[WARN]", "DISCOVERY", "Timeout nos IPs comuns"); return ""; }
+  const uint8_t commons[] = {20,  21,  22,  23,  24,  25,  10,  11,  12,
+                             13,  30,  50,  100, 101, 102, 103, 104, 105,
+                             120, 150, 200, 205, 210, 220, 230, 240};
+  for (size_t i = 0; i < sizeof(commons); ++i) {
+    if ((millis() - t0) > TMAX) {
+      logMessage("[WARN]", "DISCOVERY", "Timeout nos IPs comuns");
+      return "";
+    }
     uint8_t h = commons[i];
-    if (isInfrastructureHost(h) || h == myLast) continue;
+    if (isInfrastructureHost(h) || h == myLast)
+      continue;
 
     IPAddress ip(base[0], base[1], base[2], h);
-    
+
     // VERIFICA SE É UM DOS IPs A IGNORAR
     if (isIgnoredIP(ip.toString())) {
-      logMessage("[DEBUG]", "DISCOVERY", "Ignorando IP da lista de exclusão: " + ip.toString());
+      logMessage("[DEBUG]", "DISCOVERY",
+                 "Ignorando IP da lista de exclusão: " + ip.toString());
       continue;
     }
-    
+
     String mac;
     if (arpProbe(ip, &mac)) {
-      if (h == gwIP[3]) { logMessage("[DEBUG]", "DISCOVERY", "Ignorando gateway (" + ip.toString() + ")"); continue; }
+      if (h == gwIP[3]) {
+        logMessage("[DEBUG]", "DISCOVERY",
+                   "Ignorando gateway (" + ip.toString() + ")");
+        continue;
+      }
       pcMAC = mac;
-      logMessage("[INFO]", "DISCOVERY", "Encontrado por ARP (comum): " + ip.toString() + "  MAC=" + mac);
+      logMessage("[INFO]", "DISCOVERY",
+                 "Encontrado por ARP (comum): " + ip.toString() +
+                     "  MAC=" + mac);
       return ip.toString();
     }
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
   }
 
   int start = max(2, (int)myLast - 32);
-  int end   = min(253, (int)myLast + 32);
+  int end = min(253, (int)myLast + 32);
   for (int h = start; h <= end; ++h) {
-    if ((millis() - t0) > TMAX) { logMessage("[WARN]", "DISCOVERY", "Timeout na janela ±32"); return ""; }
-    if (h == myLast || isInfrastructureHost(h) || h == gwIP[3]) continue;
+    if ((millis() - t0) > TMAX) {
+      logMessage("[WARN]", "DISCOVERY", "Timeout na janela ±32");
+      return "";
+    }
+    if (h == myLast || isInfrastructureHost(h) || h == gwIP[3])
+      continue;
 
     IPAddress ip(base[0], base[1], base[2], (uint8_t)h);
-    
+
     // VERIFICA SE É UM DOS IPs A IGNORAR
     if (isIgnoredIP(ip.toString())) {
-      logMessage("[DEBUG]", "DISCOVERY", "Ignorando IP da lista de exclusão: " + ip.toString());
+      logMessage("[DEBUG]", "DISCOVERY",
+                 "Ignorando IP da lista de exclusão: " + ip.toString());
       continue;
     }
-    
+
     String mac;
     if (arpProbe(ip, &mac)) {
       pcMAC = mac;
-      logMessage("[INFO]", "DISCOVERY", "Encontrado por ARP (janela): " + ip.toString() + "  MAC=" + mac);
+      logMessage("[INFO]", "DISCOVERY",
+                 "Encontrado por ARP (janela): " + ip.toString() +
+                     "  MAC=" + mac);
       return ip.toString();
     }
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
   }
 
   for (int h = 2; h <= 253; ++h) {
-    if ((millis() - t0) > TMAX) { logMessage("[WARN]", "DISCOVERY", "Timeout no /24"); return ""; }
-    if (h == myLast || isInfrastructureHost(h) || h == gwIP[3] || (h >= start && h <= end)) continue;
+    if ((millis() - t0) > TMAX) {
+      logMessage("[WARN]", "DISCOVERY", "Timeout no /24");
+      return "";
+    }
+    if (h == myLast || isInfrastructureHost(h) || h == gwIP[3] ||
+        (h >= start && h <= end))
+      continue;
 
     IPAddress ip(base[0], base[1], base[2], (uint8_t)h);
-    
+
     // VERIFICA SE É UM DOS IPs A IGNORAR
     if (isIgnoredIP(ip.toString())) {
-      logMessage("[DEBUG]", "DISCOVERY", "Ignorando IP da lista de exclusão: " + ip.toString());
+      logMessage("[DEBUG]", "DISCOVERY",
+                 "Ignorando IP da lista de exclusão: " + ip.toString());
       continue;
     }
-    
+
     String mac;
     if (arpProbe(ip, &mac)) {
       pcMAC = mac;
-      logMessage("[INFO]", "DISCOVERY", "Encontrado por ARP (/24): " + ip.toString() + "  MAC=" + mac);
+      logMessage("[INFO]", "DISCOVERY",
+                 "Encontrado por ARP (/24): " + ip.toString() + "  MAC=" + mac);
       return ip.toString();
     }
     vTaskDelay(pdMS_TO_TICKS(PC_DISCOVERY_STEP_DELAY));
@@ -750,18 +860,22 @@ String discoverPC() {
 // -------------------------------------------------------------------------------------------
 //                          Funções de Controle de Relés
 // -------------------------------------------------------------------------------------------
-void activateRelay(int relayPin, RelayResetState* state, const String &relayName) {
+void activateRelay(int relayPin, RelayResetState *state,
+                   const String &relayName) {
   if (!state->relayActive) {
     digitalWrite(relayPin, HIGH);
-    state->startTime    = millis();
-    state->lastResetTime= state->startTime;
-    state->relayActive  = true;
+    state->startTime = millis();
+    state->lastResetTime = state->startTime;
+    state->relayActive = true;
     state->resetCount++;
-    logMessage("[INFO]", "RELAY", relayName + " ativado (Reset #" + String(state->resetCount) + ") - " + String(RESET_DURATION_MS/1000) + "s");
+    logMessage("[INFO]", "RELAY",
+               relayName + " ativado (Reset #" + String(state->resetCount) +
+                   ") - " + String(RESET_DURATION_MS / 1000) + "s");
   }
 }
 
-void deactivateRelay(int relayPin, RelayResetState* state, const String &relayName) {
+void deactivateRelay(int relayPin, RelayResetState *state,
+                     const String &relayName) {
   if (state->relayActive) {
     digitalWrite(relayPin, LOW);
     state->relayActive = false;
@@ -769,19 +883,26 @@ void deactivateRelay(int relayPin, RelayResetState* state, const String &relayNa
   }
 }
 
-void resetDeviceNonBlocking(int relayPin, unsigned long delayTime, RelayResetState* state) {
+void resetDeviceNonBlocking(int relayPin, unsigned long delayTime,
+                            RelayResetState *state) {
   if (state->relayActive) {
     unsigned long elapsed = millis() - state->startTime;
     if (elapsed >= delayTime) {
       digitalWrite(relayPin, LOW);
       state->relayActive = false;
-      const char* dev = (relayPin == RELAY_MODEM_PIN) ? "Modem" : (relayPin == RELAY_PC_PIN) ? "PC" : "Dispositivo";
-      logMessage("[INFO]", "RELAY", String(dev) + " religado após " + String(delayTime/1000) + "s (Pino: " + String(relayPin) + ")");
+      const char *dev = (relayPin == RELAY_MODEM_PIN) ? "Modem"
+                        : (relayPin == RELAY_PC_PIN)  ? "PC"
+                                                      : "Dispositivo";
+      logMessage("[INFO]", "RELAY",
+                 String(dev) + " religado após " + String(delayTime / 1000) +
+                     "s (Pino: " + String(relayPin) + ")");
     } else {
       unsigned long remaining = (delayTime - elapsed) / 1000;
       if (remaining % 5 == 0 || remaining <= 3) {
-        const char* dev = (relayPin == RELAY_MODEM_PIN) ? "Modem" : "PC";
-        logMessage("[DEBUG]", "RELAY", String(dev) + " aguardando religação: " + String(remaining) + "s restantes");
+        const char *dev = (relayPin == RELAY_MODEM_PIN) ? "Modem" : "PC";
+        logMessage("[DEBUG]", "RELAY",
+                   String(dev) + " aguardando religação: " + String(remaining) +
+                       "s restantes");
       }
     }
   }
@@ -793,7 +914,7 @@ void resetDeviceNonBlocking(int relayPin, unsigned long delayTime, RelayResetSta
 String obterTimestamp() {
   timeClient.update();
   time_t rawTime = timeClient.getEpochTime();
-  struct tm* timeInfo = gmtime(&rawTime);
+  struct tm *timeInfo = gmtime(&rawTime);
   char buffer[25];
   strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", timeInfo);
   return String(buffer);
@@ -805,8 +926,10 @@ void sendStatusToEndpoint() {
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(HTTP_TIMEOUT_MEDIUM);
 
-  String k3Status = digitalRead(RELAY_K3) == HIGH ? "on" : "off";
-  String k4Status = digitalRead(RELAY_K4) == HIGH ? "on" : "off";
+  String k3Status = digitalRead(RELAY_K3) == HIGH ? "1" : "0";
+  String k4Status = digitalRead(RELAY_K4) == HIGH ? "1" : "0";
+  String modemStatus = modemResetOccurred ? "1" : "0";
+  String pcStatus = pcResetOccurred ? "1" : "0";
 
   String payload = "{";
   payload += "\"csrf\": \"" + String(millis()) + "\",";
@@ -817,23 +940,28 @@ void sendStatusToEndpoint() {
   if (!deviceID.isEmpty()) {
     payload += "\"device_id\": \"" + deviceID + "\",";
   }
-  payload += "\"modem_status\": \"" + String(modemResetOccurred ? "reset" : "ok") + "\",";
-  payload += "\"pc_status\": \"" + String(pcResetOccurred ? "reset" : "ok") + "\",";
+  payload += "\"modem_status\": \"" + modemStatus + "\",";
+  payload += "\"pc_status\": \"" + pcStatus + "\",";
   payload += "\"k3_status\": \"" + k3Status + "\",";
   payload += "\"k4_status\": \"" + k4Status + "\"}";
-  
-  logMessage("[DEBUG]", "STATUS", "Enviando payload" + (deviceID.isEmpty() ? " (sem device_id)" : " com device_id=" + deviceID));
-  
+
+  logMessage("[DEBUG]", "STATUS",
+             "Enviando payload" + (deviceID.isEmpty()
+                                       ? " (sem device_id)"
+                                       : " com device_id=" + deviceID));
+
   int httpResponseCode = http.POST(payload);
 
   if (httpResponseCode > 0 && httpResponseCode < 400) {
-    logMessage("[INFO]", "STATUS", "Status enviado (" + String(httpResponseCode) + ")");
+    logMessage("[INFO]", "STATUS",
+               "Status enviado (" + String(httpResponseCode) + ")");
   } else {
-    logMessage("[ERROR]", "STATUS", "Falha ao enviar status: " + String(httpResponseCode));
+    logMessage("[ERROR]", "STATUS",
+               "Falha ao enviar status: " + String(httpResponseCode));
   }
   http.end();
   modemResetOccurred = false;
-  pcResetOccurred    = false;
+  pcResetOccurred = false;
 }
 
 void handleCommandsFromEndpoint() {
@@ -852,25 +980,56 @@ void handleCommandsFromEndpoint() {
   if (httpResponseCode == 202) {
     String response = http.getString();
     bool cmd = false;
-    if (response.indexOf("K1=0") >= 0) { externalModemReset = true; cmd = true; }
-    if (response.indexOf("K2=0") >= 0) { externalPCReset    = true; cmd = true; }
-    if (response.indexOf("K2=1") >= 0) { deactivateRelay(RELAY_PC_PIN, &pcRelayState, "PC"); confirmarRecebimentoComando("K2=1", "Ligar PC"); cmd = true; }
-    if (response.indexOf("K3=1") >= 0) { digitalWrite(RELAY_K3, HIGH); confirmarRecebimentoComando("K3=1", "Ativar K3"); cmd = true; }
-    if (response.indexOf("K3=0") >= 0) { digitalWrite(RELAY_K3, LOW);  confirmarRecebimentoComando("K3=0", "Desativar K3"); cmd = true; }
-    if (response.indexOf("K4=1") >= 0) { digitalWrite(RELAY_K4, HIGH); confirmarRecebimentoComando("K4=1", "Ativar K4"); cmd = true; }
-    if (response.indexOf("K4=0") >= 0) { digitalWrite(RELAY_K4, LOW);  confirmarRecebimentoComando("K4=0", "Desativar K4"); cmd = true; }
-    if (!cmd) { confirmarRecebimentoComando("desconhecido", "Comando não reconhecido"); }
+    if (response.indexOf("K1=0") >= 0) {
+      externalModemReset = true;
+      cmd = true;
+    }
+    if (response.indexOf("K2=0") >= 0) {
+      externalPCReset = true;
+      cmd = true;
+    }
+    if (response.indexOf("K2=1") >= 0) {
+      deactivateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
+      confirmarRecebimentoComando("K2=1", "Ligar PC");
+      cmd = true;
+    }
+    if (response.indexOf("K3=1") >= 0) {
+      digitalWrite(RELAY_K3, HIGH);
+      confirmarRecebimentoComando("K3=1", "Ativar K3");
+      cmd = true;
+    }
+    if (response.indexOf("K3=0") >= 0) {
+      digitalWrite(RELAY_K3, LOW);
+      confirmarRecebimentoComando("K3=0", "Desativar K3");
+      cmd = true;
+    }
+    if (response.indexOf("K4=1") >= 0) {
+      digitalWrite(RELAY_K4, HIGH);
+      confirmarRecebimentoComando("K4=1", "Ativar K4");
+      cmd = true;
+    }
+    if (response.indexOf("K4=0") >= 0) {
+      digitalWrite(RELAY_K4, LOW);
+      confirmarRecebimentoComando("K4=0", "Desativar K4");
+      cmd = true;
+    }
+    if (!cmd) {
+      confirmarRecebimentoComando("desconhecido", "Comando não reconhecido");
+    }
   } else if (httpResponseCode == 204) {
     // nenhum comando
   } else if (httpResponseCode > 0) {
-    logMessage("[WARN]", "COMMANDS", "Resposta inesperada: " + String(httpResponseCode));
+    logMessage("[WARN]", "COMMANDS",
+               "Resposta inesperada: " + String(httpResponseCode));
   } else {
-    logMessage("[ERROR]", "COMMANDS", "Falha HTTP: " + String(httpResponseCode));
+    logMessage("[ERROR]", "COMMANDS",
+               "Falha HTTP: " + String(httpResponseCode));
   }
   http.end();
 }
 
-void confirmarRecebimentoComando(const String &comando, const String &descricao) {
+void confirmarRecebimentoComando(const String &comando,
+                                 const String &descricao) {
   String randomCSRF = String(random(100000, 999999));
   String confirmUrl = COMMAND_SUB_CONFIR;
   confirmUrl += "?csrf=" + randomCSRF;
@@ -893,9 +1052,11 @@ void confirmarRecebimentoComando(const String &comando, const String &descricao)
     logMessage("[INFO]", "CONFIRM", "Confirmação enviada");
     logMessage("[DEBUG]", "CONFIRM", "Resposta: " + response);
   } else if (httpResponseCode > 0) {
-    logMessage("[WARN]", "CONFIRM", "Resposta inesperada: " + String(httpResponseCode));
+    logMessage("[WARN]", "CONFIRM",
+               "Resposta inesperada: " + String(httpResponseCode));
   } else {
-    logMessage("[ERROR]", "CONFIRM", "Falha ao enviar confirmação: " + String(httpResponseCode));
+    logMessage("[ERROR]", "CONFIRM",
+               "Falha ao enviar confirmação: " + String(httpResponseCode));
   }
   http.end();
 }
