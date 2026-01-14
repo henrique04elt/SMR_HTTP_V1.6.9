@@ -1,12 +1,11 @@
-/***********************************************Smart Ruler Firmware (ARP-first
- * + Device ID)***************************************** Autor: Henrique Rosa
- * Projeto: Smart Ruler (SMR)
- * Versão: 1.9.9.1 - Atualização de payloads e documentação
+/**************************************Smart Ruler Firmware (ARP-first + Device
+ * ID)***************************************** Autor: Henrique Rosa Projeto:
+ * Smart Ruler (SMR) Versão: 1.9.9.1 - Atualização de payloads e documentação
  * Data: [Jan/2026]
  * Foco desta versão:
  *   - Descoberta do PC por ARP (rápida e confiável)
  *   - EXCLUSÃO DE MÚLTIPLOS IPs (Switch e outros)
- *   - Busca do ID do dispositivo via HTTP GET
+ *   - Deteção de troca de máquina via ARP forçado
  *   - Persistência de IP/MAC/ID em NVS
  *   - Cooldown de 3 minutos após reset
  *   - Reset local do PC apenas após 3 tentativas consecutivas
@@ -136,7 +135,7 @@ bool checkModemConnectivity();
 bool checkPCConnectivity();
 String discoverPC();
 bool validatePCIP(const IPAddress &ip);
-bool arpProbe(const IPAddress &ip, String *macOut);
+bool arpProbe(const IPAddress &ip, String *macOut, bool force = false);
 bool isInfrastructureHost(uint8_t last);
 bool isIgnoredIP(const String &ip);
 void savePC(const String &ip, const String &mac, const String &id);
@@ -194,7 +193,7 @@ bool isIgnoredIP(const String &ip) {
   return false;
 }
 
-bool arpProbe(const IPAddress &ip, String *macOut) {
+bool arpProbe(const IPAddress &ip, String *macOut, bool force) {
   struct netif *nif = getEthNetif();
   if (!nif)
     return false;
@@ -204,16 +203,27 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
 
   struct eth_addr *eth_ret = nullptr;
   const ip4_addr_t *ip_ret = nullptr;
-  s8_t r = etharp_find_addr(nif, &addr, &eth_ret, &ip_ret);
-  if (r >= 0 && eth_ret) {
-    if (macOut)
-      *macOut = macToString(eth_ret->addr);
-    return true;
+  s8_t r;
+  if (!force) {
+    r = etharp_find_addr(nif, &addr, &eth_ret, &ip_ret);
+    if (r >= 0 && eth_ret) {
+      if (macOut)
+        *macOut = macToString(eth_ret->addr);
+      return true;
+    }
   }
 
   etharp_request(nif, &addr);
   uint32_t t0 = millis();
-  while ((millis() - t0) < ARP_REPLY_WAIT_MS) {
+
+  // Se for force, aguarda um tempo mínimo para garantir que a resposta ARP
+  // chegue e atualize a tabela antes de ler o cache.
+  if (force) {
+    delay(500); // Aguarda resposta ARP (Tempo aumentado para garantir refresh
+                // em trocas de PC)
+  }
+
+  while ((millis() - t0) < (force ? 500 : ARP_REPLY_WAIT_MS)) {
     r = etharp_find_addr(nif, &addr, &eth_ret, &ip_ret);
     if (r >= 0 && eth_ret) {
       if (macOut)
@@ -227,7 +237,7 @@ bool arpProbe(const IPAddress &ip, String *macOut) {
 
 bool validatePCIP(const IPAddress &ip) {
   String mac;
-  bool ok = arpProbe(ip, &mac);
+  bool ok = arpProbe(ip, &mac, true);
   if (!ok)
     return false;
 
@@ -262,11 +272,11 @@ String fetchDeviceID(const String &pcIP) {
 
   if (httpResponseCode == 200) {
     String response = http.getString();
-    StaticJsonDocument<512> doc;
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, response);
 
     if (!error) {
-      if (doc.containsKey("id")) {
+      if (!doc["id"].isNull()) {
         id = doc["id"].as<String>();
         logMessage("[INFO]", "DEVICE_ID", "ID encontrado: " + id);
       } else {
@@ -336,6 +346,7 @@ void connectivityTask(void *parameter) {
           activateRelay(RELAY_MODEM_PIN, &modemRelayState, "Modem");
           modemResetOccurred = true;
           confirmarRecebimentoComando("K1=0", "Resetar Modem");
+          sendStatusToEndpoint(); // Envio imediato após reset
         } else {
           confirmarRecebimentoComando("K1=0",
                                       "Reset modem negado - intervalo mínimo");
@@ -350,6 +361,7 @@ void connectivityTask(void *parameter) {
           pcResetOccurred = true;
           pcConsecutiveFailures = 0;
           confirmarRecebimentoComando("K2=0", "Resetar PC");
+          sendStatusToEndpoint(); // Envio imediato após reset
         } else {
           confirmarRecebimentoComando("K2=0",
                                       "Reset PC negado - intervalo mínimo");
@@ -454,6 +466,25 @@ void connectivityTask(void *parameter) {
                            String(pcConsecutiveFailures) + "/" +
                            String(PC_MAX_FAILURES_BEFORE_RESET));
 
+            // Se falhar 3 vezes (limiar de reset), limpa o IP para forçar nova
+            // varredura rápida
+            if (pcConsecutiveFailures >= PC_MAX_FAILURES_BEFORE_RESET) {
+              logMessage("[ERROR]", "CONNECTIVITY",
+                         "PC offline persistente. LIMPANDO IP e ID para nova "
+                         "varredura.");
+              pcIP = "";
+              deviceID = ""; // Limpa ID também
+            }
+
+            // Se falhar persistentemente (ex: 10 vezes), esquece o IP para
+            // forçar nova varredura
+            if (pcConsecutiveFailures >= 10) {
+              logMessage("[ERROR]", "CONNECTIVITY",
+                         "PC offline persistente (10 falhas). LIMPANDO TUDO.");
+              clearSavedPC();
+              pcIP = "";
+            }
+
             // Só reseta após 3 tentativas consecutivas
             if (pcConsecutiveFailures >= PC_MAX_FAILURES_BEFORE_RESET) {
               if (!pcRelayState.relayActive &&
@@ -465,7 +496,12 @@ void connectivityTask(void *parameter) {
                                " tentativas - Executando reset");
                 activateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
                 pcResetOccurred = true;
+                // pcConsecutiveFailures será zerado na próxima checagem bem
+                // sucedida ou aqui se desejado, mas para lógica de limpeza
+                // acima funcionar, não podemos zerar antes. Zerando AGORA que
+                // já usamos os valores.
                 pcConsecutiveFailures = 0;
+                sendStatusToEndpoint(); // Envio imediato após reset local
               }
             }
           } else {
@@ -478,11 +514,34 @@ void connectivityTask(void *parameter) {
               pcConsecutiveFailures = 0;
             }
 
-            if (deviceID.isEmpty()) {
-              deviceID = fetchDeviceID(pcIP);
-              if (!deviceID.isEmpty()) {
+            // Sempre tenta validar o ID para detectar troca de máquina (mesmo
+            // IP, ID diferente)
+            String currentID = fetchDeviceID(pcIP);
+
+            if (!currentID.isEmpty()) {
+              if (deviceID.isEmpty()) {
+                deviceID = currentID;
                 logMessage("[INFO]", "CONNECTIVITY",
                            "Device ID obtido na reverificação: " + deviceID);
+                savePC(pcIP, pcMAC, deviceID);
+              } else if (deviceID != currentID) {
+                logMessage("[WARN]", "CONNECTIVITY",
+                           "TROCA DE PC DETECTADA (ID alterado: " + deviceID +
+                               " -> " + currentID + "). Atualizando cadastro.");
+                deviceID = currentID;
+
+                // Atualiza MAC se necessário
+                String currentMAC;
+                IPAddress ip;
+                ip.fromString(pcIP);
+                if (arpProbe(ip, &currentMAC, true)) {
+                  if (pcMAC != currentMAC) {
+                    logMessage("[INFO]", "CONNECTIVITY",
+                               "MAC atualizado na troca de ID: " + pcMAC +
+                                   " -> " + currentMAC);
+                    pcMAC = currentMAC;
+                  }
+                }
                 savePC(pcIP, pcMAC, deviceID);
               }
             }
@@ -641,14 +700,26 @@ void setup() {
                      (deviceID.isEmpty() ? "" : "  ID=" + deviceID));
       IPAddress ip;
       ip.fromString(pcIP);
+      String savedMAC = pcMAC;
       if (!validatePCIP(ip)) {
         logMessage("[WARN]", "DISCOVERY",
                    "PC salvo inválido. Nova descoberta será necessária.");
         clearSavedPC();
-      } else if (deviceID.isEmpty()) {
-        deviceID = fetchDeviceID(pcIP);
-        if (!deviceID.isEmpty()) {
+      } else {
+        // Verifica se o MAC mudou durante a validação inicial
+        if (pcMAC != savedMAC) {
+          logMessage("[WARN]", "DISCOVERY",
+                     "MAC alterado no boot (" + savedMAC + " -> " + pcMAC +
+                         "). LIMPANDO IDENTITY.");
+          deviceID = "";
           savePC(pcIP, pcMAC, deviceID);
+        }
+
+        if (deviceID.isEmpty()) {
+          deviceID = fetchDeviceID(pcIP);
+          if (!deviceID.isEmpty()) {
+            savePC(pcIP, pcMAC, deviceID);
+          }
         }
       }
     }
@@ -721,11 +792,13 @@ bool checkPCConnectivity() {
   IPAddress ip;
   ip.fromString(pcIP);
   String mac;
-  bool arpOk = arpProbe(ip, &mac);
+  bool arpOk = arpProbe(ip, &mac, true);
   if (arpOk && !pcMAC.isEmpty() && !mac.isEmpty() && (mac != pcMAC)) {
     logMessage("[WARN]", "PC",
-               "MAC diferente do persistido. Atualizando registro.");
+               "MAC diferente do persistido (" + pcMAC + " -> " + mac +
+                   "). LIMPANDO IDENTITY.");
     pcMAC = mac;
+    deviceID = ""; // Limpa o ID antigo para forçar nova busca
     savePC(pcIP, pcMAC, deviceID);
   }
 
@@ -926,8 +999,9 @@ void sendStatusToEndpoint() {
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(HTTP_TIMEOUT_MEDIUM);
 
-  String k3Status = digitalRead(RELAY_K3) == HIGH ? "1" : "0";
-  String k4Status = digitalRead(RELAY_K4) == HIGH ? "1" : "0";
+  // Lógica de Status: 1=Ligado/Acionado (Pino LOW), 0=Desligar (Pino HIGH)
+  String k3Status = digitalRead(RELAY_K3) == LOW ? "1" : "0";
+  String k4Status = digitalRead(RELAY_K4) == LOW ? "1" : "0";
   String modemStatus = modemResetOccurred ? "1" : "0";
   String pcStatus = pcResetOccurred ? "1" : "0";
 
@@ -940,15 +1014,12 @@ void sendStatusToEndpoint() {
   if (!deviceID.isEmpty()) {
     payload += "\"device_id\": \"" + deviceID + "\",";
   }
-  payload += "\"modem_status\": \"" + modemStatus + "\",";
-  payload += "\"pc_status\": \"" + pcStatus + "\",";
-  payload += "\"k3_status\": \"" + k3Status + "\",";
-  payload += "\"k4_status\": \"" + k4Status + "\"}";
+  payload += "\"modem_status\": " + modemStatus + ",";
+  payload += "\"pc_status\": " + pcStatus + ",";
+  payload += "\"k3_status\": " + k3Status + ",";
+  payload += "\"k4_status\": " + k4Status + "}";
 
-  logMessage("[DEBUG]", "STATUS",
-             "Enviando payload" + (deviceID.isEmpty()
-                                       ? " (sem device_id)"
-                                       : " com device_id=" + deviceID));
+  logMessage("[DEBUG]", "STATUS", "Payload enviado: " + payload);
 
   int httpResponseCode = http.POST(payload);
 
@@ -991,26 +1062,31 @@ void handleCommandsFromEndpoint() {
     if (response.indexOf("K2=1") >= 0) {
       deactivateRelay(RELAY_PC_PIN, &pcRelayState, "PC");
       confirmarRecebimentoComando("K2=1", "Ligar PC");
+      sendStatusToEndpoint();
       cmd = true;
     }
-    if (response.indexOf("K3=1") >= 0) {
+    if (response.indexOf("K3=1") >= 0) { // Desligar
       digitalWrite(RELAY_K3, HIGH);
-      confirmarRecebimentoComando("K3=1", "Ativar K3");
+      confirmarRecebimentoComando("K3=1", "Desativar K3");
+      sendStatusToEndpoint();
       cmd = true;
     }
-    if (response.indexOf("K3=0") >= 0) {
+    if (response.indexOf("K3=0") >= 0) { // Ligar
       digitalWrite(RELAY_K3, LOW);
-      confirmarRecebimentoComando("K3=0", "Desativar K3");
+      confirmarRecebimentoComando("K3=0", "Ativar K3");
+      sendStatusToEndpoint();
       cmd = true;
     }
-    if (response.indexOf("K4=1") >= 0) {
+    if (response.indexOf("K4=1") >= 0) { // Desligar
       digitalWrite(RELAY_K4, HIGH);
-      confirmarRecebimentoComando("K4=1", "Ativar K4");
+      confirmarRecebimentoComando("K4=1", "Desativar K4");
+      sendStatusToEndpoint();
       cmd = true;
     }
-    if (response.indexOf("K4=0") >= 0) {
+    if (response.indexOf("K4=0") >= 0) { // Ligar
       digitalWrite(RELAY_K4, LOW);
-      confirmarRecebimentoComando("K4=0", "Desativar K4");
+      confirmarRecebimentoComando("K4=0", "Ativar K4");
+      sendStatusToEndpoint();
       cmd = true;
     }
     if (!cmd) {
